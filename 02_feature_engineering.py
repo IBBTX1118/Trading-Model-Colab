@@ -1,11 +1,12 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 3.0 (診斷版本：不使用 pandas-ta)
+# 版本: 4.0 (正式版：使用 TA-Lib)
 
 """
-此腳本為特徵工程的診斷版本。
+此腳本為特徵工程的正式版本。
 
-它將不再使用 pandas-ta 函式庫，而是手動計算一個簡單的 SMA 指標，
-以驗證基礎的讀取-處理-儲存流程是否正常。
+它會讀取由 01_data_acquisition.py 產生的 Parquet 格式市場數據，
+然後使用業界標準的 TA-Lib 函式庫為數據批量添加技術指標，
+最終將帶有特徵的數據儲存到新的輸出目錄中。
 """
 
 import logging
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import List
 
 import pandas as pd
-# import pandas_ta as ta # <--- 我們刻意將此行註解掉，不導入有問題的函式庫
+import talib  # 導入 TA-Lib
 
 
 # ==============================================================================
@@ -60,14 +61,43 @@ class FeatureEngineer:
 
     def add_features_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        手動為 DataFrame 添加技術指標。
+        使用 TA-Lib 為 DataFrame 添加技術指標。
         """
         if df.empty:
             return df
         
-        # 直接使用 pandas 內建功能，手動計算 20 週期的簡單移動平均線 (SMA)
-        self.logger.info("手動計算 SMA_20...")
-        df['SMA_20'] = df['close'].rolling(window=20).mean()
+        self.logger.info("使用 TA-Lib 計算技術指標...")
+        # TA-Lib 通常需要 Numpy Array 作為輸入，我們先準備好
+        open_prices = df['open'].to_numpy()
+        high_prices = df['high'].to_numpy()
+        low_prices = df['low'].to_numpy()
+        close_prices = df['close'].to_numpy()
+        volume = df['tick_volume'].to_numpy()
+
+        # --- 動能指標 (Momentum) ---
+        df['SMA_20'] = talib.SMA(close_prices, timeperiod=20)
+        df['SMA_50'] = talib.SMA(close_prices, timeperiod=50)
+        df['EMA_20'] = talib.EMA(close_prices, timeperiod=20)
+        df['EMA_50'] = talib.EMA(close_prices, timeperiod=50)
+        df['RSI_14'] = talib.RSI(close_prices, timeperiod=14)
+        
+        # MACD 會回傳三個序列：MACD線、信號線、柱狀圖
+        macd, macdsignal, macdhist = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
+        df['MACD'] = macd
+        df['MACD_signal'] = macdsignal
+        df['MACD_hist'] = macdhist
+
+        # --- 波動率指標 (Volatility) ---
+        # 布林帶會回傳三個序列：上軌、中軌、下軌
+        upper, middle, lower = talib.BBANDS(close_prices, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+        df['BB_upper'] = upper
+        df['BB_middle'] = middle
+        df['BB_lower'] = lower
+        
+        df['ATR_14'] = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
+
+        # --- 成交量相關指標 (Volume) ---
+        df['OBV'] = talib.OBV(close_prices, volume)
         
         return df
 
