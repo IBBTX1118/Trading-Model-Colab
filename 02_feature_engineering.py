@@ -1,12 +1,11 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 4.0 (正式版：使用 TA-Lib)
+# 版本: 5.0 (正式版：使用 finta)
 
 """
 此腳本為特徵工程的正式版本。
 
-它會讀取由 01_data_acquisition.py 產生的 Parquet 格式市場數據，
-然後使用業界標準的 TA-Lib 函式庫為數據批量添加技術指標，
-最終將帶有特徵的數據儲存到新的輸出目錄中。
+它會讀取處理好的市場數據，並使用 finta (純 Python 函式庫)
+來為數據批量添加技術指標，解決 TA-Lib 的安裝問題。
 """
 
 import logging
@@ -15,7 +14,7 @@ from pathlib import Path
 from typing import List
 
 import pandas as pd
-import talib  # 導入 TA-Lib
+from finta import TA  # 導入 finta
 
 
 # ==============================================================================
@@ -41,11 +40,11 @@ class FeatureEngineer:
 
     def _setup_logger(self) -> logging.Logger:
         """配置日誌記錄器。"""
+        # ... (此函數內容與之前版本相同) ...
         logger = logging.getLogger(self.__class__.__name__)
         logger.setLevel(self.config.LOG_LEVEL.upper())
         if logger.hasHandlers():
             logger.handlers.clear()
-        
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(formatter)
@@ -54,6 +53,7 @@ class FeatureEngineer:
 
     def find_input_files(self) -> List[Path]:
         """遞迴地尋找所有輸入的 Parquet 檔案。"""
+        # ... (此函數內容與之前版本相同) ...
         self.logger.info(f"正在從 '{self.config.INPUT_BASE_DIR}' 尋找輸入檔案...")
         files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
         self.logger.info(f"找到了 {len(files)} 個 Parquet 檔案。")
@@ -61,43 +61,38 @@ class FeatureEngineer:
 
     def add_features_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        使用 TA-Lib 為 DataFrame 添加技術指標。
+        使用 finta 為 DataFrame 添加技術指標。
+        finta 會自動尋找 'open', 'high', 'low', 'close', 'volume' 欄位。
         """
         if df.empty:
             return df
         
-        self.logger.info("使用 TA-Lib 計算技術指標...")
-        # TA-Lib 通常需要 Numpy Array 作為輸入，我們先準備好
-        open_prices = df['open'].to_numpy()
-        high_prices = df['high'].to_numpy()
-        low_prices = df['low'].to_numpy()
-        close_prices = df['close'].to_numpy()
-        volume = df['tick_volume'].to_numpy()
+        self.logger.info("使用 finta 計算技術指標...")
 
         # --- 動能指標 (Momentum) ---
-        df['SMA_20'] = talib.SMA(close_prices, timeperiod=20)
-        df['SMA_50'] = talib.SMA(close_prices, timeperiod=50)
-        df['EMA_20'] = talib.EMA(close_prices, timeperiod=20)
-        df['EMA_50'] = talib.EMA(close_prices, timeperiod=50)
-        df['RSI_14'] = talib.RSI(close_prices, timeperiod=14)
+        df['SMA_20'] = TA.SMA(df, period=20)
+        df['SMA_50'] = TA.SMA(df, period=50)
+        df['EMA_20'] = TA.EMA(df, period=20)
+        df['EMA_50'] = TA.EMA(df, period=50)
+        df['RSI_14'] = TA.RSI(df, period=14)
         
-        # MACD 會回傳三個序列：MACD線、信號線、柱狀圖
-        macd, macdsignal, macdhist = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
-        df['MACD'] = macd
-        df['MACD_signal'] = macdsignal
-        df['MACD_hist'] = macdhist
+        # MACD 會回傳一個包含 MACD 和 SIGNAL 欄位的 DataFrame，我們將它合併回來
+        macd = TA.MACD(df)
+        df = df.join(macd)
 
         # --- 波動率指標 (Volatility) ---
-        # 布林帶會回傳三個序列：上軌、中軌、下軌
-        upper, middle, lower = talib.BBANDS(close_prices, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
-        df['BB_upper'] = upper
-        df['BB_middle'] = middle
-        df['BB_lower'] = lower
+        # 布林帶也會回傳一個包含多個欄位的 DataFrame
+        bbands = TA.BBANDS(df)
+        df = df.join(bbands)
         
-        df['ATR_14'] = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
+        df['ATR_14'] = TA.ATR(df, period=14)
 
         # --- 成交量相關指標 (Volume) ---
-        df['OBV'] = talib.OBV(close_prices, volume)
+        # finta 的 volume 欄位名稱預設是 'volume'，我們的是 'tick_volume'
+        # 我們需要先將欄位重命名，計算完再改回來
+        df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+        df['OBV'] = TA.OBV(df)
+        df.rename(columns={'volume': 'tick_volume'}, inplace=True)
         
         return df
 
@@ -105,43 +100,36 @@ class FeatureEngineer:
         """
         處理單一檔案：讀取、添加特徵、儲存。
         """
+        # ... (此函數內容與之前版本相同) ...
         try:
             self.logger.info(f"--- 開始處理檔案: {file_path.name} ---")
             df = pd.read_parquet(file_path)
-            
             initial_cols = df.shape[1]
             df_with_features = self.add_features_to_dataframe(df)
-            
             df_with_features.dropna(inplace=True)
-            
             final_cols = df_with_features.shape[1]
             self.logger.info(f"成功添加了 {final_cols - initial_cols} 個新特徵。")
-            
             relative_path = file_path.relative_to(self.config.INPUT_BASE_DIR)
             output_path = self.config.OUTPUT_BASE_DIR / relative_path.with_name(f"{file_path.stem}_features.parquet")
-            
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            
             df_with_features.to_parquet(output_path)
             self.logger.info(f"已儲存帶有特徵的檔案到: {output_path}")
-
         except Exception as e:
             self.logger.error(f"處理檔案 {file_path.name} 時發生錯誤: {e}", exc_info=True)
+
 
     def run(self) -> None:
         """
         執行完整的特徵工程流程。
         """
+        # ... (此函數內容與之前版本相同) ...
         self.logger.info("========= 特徵工程流程開始 =========")
         input_files = self.find_input_files()
-        
         if not input_files:
             self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。")
             return
-
         for file_path in input_files:
             self.process_file(file_path)
-            
         self.logger.info("========= 所有檔案處理完畢，特徵工程流程結束 =========")
 
 
