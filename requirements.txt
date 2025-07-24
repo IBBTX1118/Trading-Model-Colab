@@ -1,5 +1,6 @@
 pydantic
 pyarrow
 seaborn
-pandas-ta-openbb
+pandas
+finta
 setuptools
