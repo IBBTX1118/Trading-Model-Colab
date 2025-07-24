@@ -4,3 +4,5 @@ seaborn
 pandas
 finta
 setuptools
+backtrader
+matplotlib
