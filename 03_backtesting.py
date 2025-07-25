@@ -99,8 +99,7 @@ if __name__ == '__main__':
     print(f"最大回撤: {drawdown.max.drawdown:.2f}%")
     print(f"{'='*72}\n")
 
-    print('正在生成圖表...')
-    # 儲存圖表到檔案
-    figure = cerebro.plot(style='candlestick', iplot=False)[0][0]
-    figure.savefig('backtest_result.png')
-    print('圖表已儲存為 backtest_result.png')
+
+    print("\n[INFO] Backtest calculation complete.")
+    print("[INFO] Skipping built-in plotting due to environment conflicts.")
+    print("[INFO] You can now proceed to the next step for manual plotting or analysis.")
