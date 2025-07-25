@@ -1,12 +1,9 @@
 # 檔名: 03_backtesting.py
-# 版本: 3.0 (正式版：使用 finta 數據源)
+# 版本: 3.1 (最終版：修正 Matplotlib 後端問題)
 
-"""
-此腳本為策略回測階段。
-
-它會讀取由 finta 版本的 02_feature_engineering.py 產生的特徵檔案，
-並使用 Backtrader 框架來執行一個簡單的交易策略。
-"""
+import matplotlib
+# 關鍵修正：在導入 backtrader 之前，強制設定 matplotlib 使用無 GUI 的 'Agg' 後端
+matplotlib.use('Agg')
 
 import backtrader as bt
 import pandas as pd
@@ -26,7 +23,6 @@ class PandasDataWithFeatures(bt.feeds.PandasData):
         'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',  # finta 的布林帶輸出欄位
         'ATR_14', 'OBV',
     )
-
     params = (
         ('SMA_20', -1), ('SMA_50', -1), ('EMA_20', -1), ('EMA_50', -1),
         ('RSI_14', -1), ('MACD', -1), ('SIGNAL', -1), ('BB_UPPER', -1),
@@ -42,28 +38,23 @@ class SmaCrossStrategy(bt.Strategy):
     params = (('short_sma_period', 20), ('long_sma_period', 50),)
 
     def __init__(self):
-        # 根據參數動態獲取對應的 SMA 數據線
-        # 注意：這裡的欄位名稱必須與 PandasDataWithFeatures 中 lines 定義的完全一致
         short_sma_name = f"SMA_{self.p.short_sma_period}"
         long_sma_name = f"SMA_{self.p.long_sma_period}"
-        
         self.short_sma = getattr(self.data.lines, short_sma_name)
         self.long_sma = getattr(self.data.lines, long_sma_name)
-        
         self.crossover = bt.indicators.CrossOver(self.short_sma, self.long_sma)
 
     def next(self):
-        if not self.position:  # 如果沒有倉位
-            if self.crossover > 0:  # 黃金交叉
+        if not self.position:
+            if self.crossover > 0:
                 self.log('進場 BUY')
                 self.buy()
-        else:  # 如果有倉位
-            if self.crossover < 0:  # 死亡交叉
+        else:
+            if self.crossover < 0:
                 self.log('平倉 SELL')
                 self.close()
 
     def log(self, txt, dt=None):
-        """策略的日誌記錄功能"""
         dt = dt or self.datas[0].datetime.date(0)
         print(f'{dt.isoformat()}, {txt}')
 
@@ -72,8 +63,7 @@ class SmaCrossStrategy(bt.Strategy):
 # 3. 主程式執行區塊
 # ==============================================================================
 if __name__ == '__main__':
-    cerebro = bt.Cerebro()
-
+    cerebro = bt.Cebro()
     data_path = Path("Output_Feature_Engineering/MarketData_with_Features/EURUSD_sml/EURUSD_sml_H4_features.parquet")
     
     print(f"正在加載數據: {data_path}")
@@ -100,7 +90,6 @@ if __name__ == '__main__':
     print(f"初始資金: 10000.00")
     print(f"最終資產: {cerebro.broker.getvalue():.2f}")
     
-    # ... (後續績效打印部分與之前相同) ...
     analysis = strat.analyzers.trade_analyzer.get_analysis()
     sharpe = strat.analyzers.sharpe_ratio.get_analysis()
     drawdown = strat.analyzers.drawdown.get_analysis()
