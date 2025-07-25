@@ -100,20 +100,44 @@ class FeatureEngineer:
         """
         處理單一檔案：讀取、添加特徵、儲存。
         """
-        # ... (此函數內容與之前版本相同) ...
         try:
             self.logger.info(f"--- 開始處理檔案: {file_path.name} ---")
             df = pd.read_parquet(file_path)
+
+            # --- 偵錯訊息 ---
+            print(f"[偵錯] 正在處理的原始檔案完整路徑: {file_path}")
+            
+            relative_path = file_path.relative_to(self.config.INPUT_BASE_DIR)
+            print(f"[偵錯] 計算出的相對路徑: {relative_path}")
+
+            # --- 優化的路徑建立邏輯 ---
+            # 1. 取得相對路徑中的目錄部分 (例如 'EURUSD_sml')
+            output_subfolder = relative_path.parent
+            print(f"[偵錯] 輸出子資料夾: {output_subfolder}")
+
+            # 2. 建立新的檔名
+            new_filename = f"{file_path.stem}_features.parquet"
+            print(f"[偵錯] 新的檔名: {new_filename}")
+
+            # 3. 組合出最終的完整輸出路徑
+            output_path = self.config.OUTPUT_BASE_DIR / output_subfolder / new_filename
+            print(f"[偵錯] 最終的完整輸出路徑: {output_path}")
+            # --- 優化結束 ---
+            
             initial_cols = df.shape[1]
             df_with_features = self.add_features_to_dataframe(df)
+            
             df_with_features.dropna(inplace=True)
+            
             final_cols = df_with_features.shape[1]
             self.logger.info(f"成功添加了 {final_cols - initial_cols} 個新特徵。")
-            relative_path = file_path.relative_to(self.config.INPUT_BASE_DIR)
-            output_path = self.config.OUTPUT_BASE_DIR / relative_path.with_name(f"{file_path.stem}_features.parquet")
+            
+            # 確保最終輸出目錄存在
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            
             df_with_features.to_parquet(output_path)
             self.logger.info(f"已儲存帶有特徵的檔案到: {output_path}")
+
         except Exception as e:
             self.logger.error(f"處理檔案 {file_path.name} 時發生錯誤: {e}", exc_info=True)
 
