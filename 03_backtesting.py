@@ -12,11 +12,12 @@ from pathlib import Path
 # ==============================================================================
 # 1. 建立自訂數據饋送類別 (Custom Data Feed)
 # ==============================================================================
+# 這個版本精確匹配 finta 函式庫的輸出欄位名稱
 class PandasDataWithFeatures(bt.feeds.PandasData):
     lines = (
         'SMA_20', 'SMA_50', 'EMA_20', 'EMA_50', 'RSI_14',
-        'MACD', 'SIGNAL',
-        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',
+        'MACD', 'SIGNAL',  # finta 的 MACD 輸出欄位
+        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',  # finta 的布林帶輸出欄位
         'ATR_14', 'OBV',
     )
     params = (
@@ -24,6 +25,7 @@ class PandasDataWithFeatures(bt.feeds.PandasData):
         ('RSI_14', -1), ('MACD', -1), ('SIGNAL', -1), ('BB_UPPER', -1),
         ('BB_MIDDLE', -1), ('BB_LOWER', -1), ('ATR_14', -1), ('OBV', -1),
     )
+
 
 # ==============================================================================
 # 2. 建立策略類別
@@ -58,7 +60,7 @@ class SmaCrossStrategy(bt.Strategy):
 if __name__ == '__main__':
     cerebro = bt.Cerebro() # 已修正拼寫錯誤
     data_path = Path("Output_Feature_Engineering/MarketData_with_Features/EURUSD_sml/EURUSD_sml_H4_features.parquet")
-    
+
     print(f"正在加載數據: {data_path}")
     df = pd.read_parquet(data_path)
     df.index = pd.to_datetime(df.index)
@@ -98,6 +100,7 @@ if __name__ == '__main__':
     print(f"{'='*72}\n")
 
     print('正在生成圖表...')
+    # 儲存圖表到檔案
     figure = cerebro.plot(style='candlestick', iplot=False)[0][0]
     figure.savefig('backtest_result.png')
     print('圖表已儲存為 backtest_result.png')
