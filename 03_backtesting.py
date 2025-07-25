@@ -28,7 +28,7 @@ if __name__ == '__main__':
     cerebro = bt.Cerebro() # 建立大腦
 
     # 讀取帶有特徵的數據
-    data_path = Path("Output_Feature_Engineering/MarketData_with_Features/EURUSD_sml/EURUSD_sml_H4_features.parquet")
+    data_path = Path("Output_Feature_Engineering/EURUSD_sml/EURUSD_sml_H4_features.parquet")
     df = pd.read_parquet(data_path)
     df.index = pd.to_datetime(df.index) # 確保時間索引格式正確
 
