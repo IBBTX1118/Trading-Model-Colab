@@ -63,7 +63,7 @@ class SmaCrossStrategy(bt.Strategy):
 # 3. 主程式執行區塊
 # ==============================================================================
 if __name__ == '__main__':
-    cerebro = bt.Cebro()
+    cerebro = bt.Cerebro()
     data_path = Path("Output_Feature_Engineering/MarketData_with_Features/EURUSD_sml/EURUSD_sml_H4_features.parquet")
     
     print(f"正在加載數據: {data_path}")
