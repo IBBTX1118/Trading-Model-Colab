@@ -9,8 +9,8 @@ class SmaCrossStrategy(bt.Strategy):
     def __init__(self):
         # 因為特徵已預先算好，我們直接從數據中引用
         # 注意欄位名稱需與 .parquet 檔案中的完全一致
-        self.short_sma = self.data.lines.getline('SMA_' + str(self.p.short_sma))
-        self.long_sma = self.data.lines.getline('SMA_' + str(self.p.long_sma))
+        self.short_sma = self.data.lines._getline('SMA_' + str(self.p.short_sma))
+        self.long_sma = self.data.lines._getline('SMA_' + str(self.p.long_sma))
 
     def next(self):
         # 如果已有倉位，則暫不操作
