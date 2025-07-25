@@ -1,11 +1,11 @@
 # 檔名: 03_backtesting.py
-# 版本: 1.0 (正式版：使用 Backtrader)
+# 版本: 3.0 (正式版：使用 finta 數據源)
 
 """
 此腳本為策略回測階段。
 
-它會讀取由 02_feature_engineering.py 產生的、帶有特徵的 Parquet 檔案，
-然後使用 Backtrader 框架來執行一個簡單的交易策略，並輸出績效報告與圖表。
+它會讀取由 finta 版本的 02_feature_engineering.py 產生的特徵檔案，
+並使用 Backtrader 框架來執行一個簡單的交易策略。
 """
 
 import backtrader as bt
@@ -15,21 +15,18 @@ from pathlib import Path
 # ==============================================================================
 # 1. 建立自訂數據饋送類別 (Custom Data Feed)
 # ==============================================================================
-# 我們繼承 bt.feeds.PandasData，並告訴它我們有哪些額外的特徵欄位
+# 這個版本精確匹配 finta 函式庫的輸出欄位名稱
 class PandasDataWithFeatures(bt.feeds.PandasData):
     """
-    一個自訂的數據饋送，用來讓 Backtrader 識別我們預先計算好的特徵。
+    自訂數據饋送，用來識別由 finta 產生的特徵欄位。
     """
-    # 告訴 Backtrader，我們的數據中有這些額外的「數據線 (Line)」
     lines = (
         'SMA_20', 'SMA_50', 'EMA_20', 'EMA_50', 'RSI_14',
-        'MACD', 'SIGNAL', # finta 的 MACD 輸出欄位
-        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', # finta 的布林帶輸出欄位
+        'MACD', 'SIGNAL',  # finta 的 MACD 輸出欄位
+        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',  # finta 的布林帶輸出欄位
         'ATR_14', 'OBV',
     )
 
-    # 將這些數據線與 DataFrame 中的欄位對應起來
-    # -1 表示 Backtrader 會自動按名稱尋找對應的欄位
     params = (
         ('SMA_20', -1), ('SMA_50', -1), ('EMA_20', -1), ('EMA_50', -1),
         ('RSI_14', -1), ('MACD', -1), ('SIGNAL', -1), ('BB_UPPER', -1),
@@ -42,30 +39,28 @@ class PandasDataWithFeatures(bt.feeds.PandasData):
 # ==============================================================================
 class SmaCrossStrategy(bt.Strategy):
     """一個簡單的雙均線交叉策略"""
-    params = (('short_sma', 20), ('long_sma', 50),)
+    params = (('short_sma_period', 20), ('long_sma_period', 50),)
 
     def __init__(self):
-        # 現在可以直接透過 .lines.xxx 的方式來存取我們自訂的數據線
-        # 注意：這裡的名稱必須與 PandasDataWithFeatures 中 lines 定義的完全一致
-        self.short_sma = self.data.lines.SMA_20
-        self.long_sma = self.data.lines.SMA_50
+        # 根據參數動態獲取對應的 SMA 數據線
+        # 注意：這裡的欄位名稱必須與 PandasDataWithFeatures 中 lines 定義的完全一致
+        short_sma_name = f"SMA_{self.p.short_sma_period}"
+        long_sma_name = f"SMA_{self.p.long_sma_period}"
         
-        # 使用 Backtrader 內建的交叉指標，讓邏輯更簡潔
+        self.short_sma = getattr(self.data.lines, short_sma_name)
+        self.long_sma = getattr(self.data.lines, long_sma_name)
+        
         self.crossover = bt.indicators.CrossOver(self.short_sma, self.long_sma)
 
     def next(self):
-        # 如果已有倉位
-        if self.position:
-            # 如果出現死亡交叉 (短期均線下穿長期均線)，則平倉
-            if self.crossover < 0:
-                self.log('平倉 SELL')
-                self.close()
-        # 如果沒有倉位
-        else:
-            # 如果出現黃金交叉 (短期均線上穿長期均線)，則進場
-            if self.crossover > 0:
+        if not self.position:  # 如果沒有倉位
+            if self.crossover > 0:  # 黃金交叉
                 self.log('進場 BUY')
                 self.buy()
+        else:  # 如果有倉位
+            if self.crossover < 0:  # 死亡交叉
+                self.log('平倉 SELL')
+                self.close()
 
     def log(self, txt, dt=None):
         """策略的日誌記錄功能"""
@@ -77,41 +72,35 @@ class SmaCrossStrategy(bt.Strategy):
 # 3. 主程式執行區塊
 # ==============================================================================
 if __name__ == '__main__':
-    cerebro = bt.Cerebro() # 建立 Cerebro 引擎
+    cerebro = bt.Cerebro()
 
-    # --- 數據加載 ---
-    # 您可以修改這個路徑來回測不同的商品或時間週期
     data_path = Path("Output_Feature_Engineering/EURUSD_sml/EURUSD_sml_H4_features.parquet")
     
     print(f"正在加載數據: {data_path}")
     df = pd.read_parquet(data_path)
-    df.index = pd.to_datetime(df.index) # 確保時間索引格式正確
+    df.index = pd.to_datetime(df.index)
 
-    # 關鍵：使用我們自訂的 PandasDataWithFeatures
     data_feed = PandasDataWithFeatures(dataname=df)
     cerebro.adddata(data_feed)
 
-    # --- 策略與參數設定 ---
     cerebro.addstrategy(SmaCrossStrategy)
-    cerebro.broker.setcash(10000.0) # 設定初始資金
-    cerebro.broker.setcommission(commission=0.001) # 設定交易佣金 (例如千分之一)
+    cerebro.broker.setcash(10000.0)
+    cerebro.broker.setcommission(commission=0.001)
 
-    # --- 績效分析工具 ---
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
 
-    # --- 執行與結果打印 ---
     print('開始回測...')
     results = cerebro.run()
     strat = results[0]
     print('回測結束。')
 
-    # 打印績效報告
     print(f"\n{'='*30} 績效報告 {'='*30}")
     print(f"初始資金: 10000.00")
     print(f"最終資產: {cerebro.broker.getvalue():.2f}")
     
+    # ... (後續績效打印部分與之前相同) ...
     analysis = strat.analyzers.trade_analyzer.get_analysis()
     sharpe = strat.analyzers.sharpe_ratio.get_analysis()
     drawdown = strat.analyzers.drawdown.get_analysis()
@@ -126,8 +115,8 @@ if __name__ == '__main__':
     print(f"最大回撤: {drawdown.max.drawdown:.2f}%")
     print(f"{'='*72}\n")
 
-    # 繪製績效圖
-    # 在 Colab 中，iplot=False 會將圖表儲存為 plot.png 檔案
     print('正在生成圖表...')
-    cerebro.plot(style='candlestick', iplot=False)
-    print('圖表已儲存為 plot.png')
+    # 儲存圖表到檔案
+    figure = cerebro.plot(style='candlestick', iplot=False)[0][0]
+    figure.savefig('backtest_result.png')
+    print('圖表已儲存為 backtest_result.png')
