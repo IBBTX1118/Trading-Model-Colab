@@ -74,7 +74,7 @@ class SmaCrossStrategy(bt.Strategy):
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
 
-    data_path = Path("Output_Feature_Engineering/EURUSD_sml/EURUSD_sml_H4_features.parquet")
+    data_path = Path("Output_Feature_Engineering/MarketData_with_Features/EURUSD_sml/EURUSD_sml_H4_features.parquet")
     
     print(f"正在加載數據: {data_path}")
     df = pd.read_parquet(data_path)
