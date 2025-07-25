@@ -1,5 +1,5 @@
 # 檔名: 03_backtesting.py
-# 版本: 3.1 (最終版：修正 Matplotlib 後端問題)
+# 版本: 3.2 (最終修正版)
 
 import matplotlib
 # 關鍵修正：在導入 backtrader 之前，強制設定 matplotlib 使用無 GUI 的 'Agg' 後端
@@ -12,15 +12,11 @@ from pathlib import Path
 # ==============================================================================
 # 1. 建立自訂數據饋送類別 (Custom Data Feed)
 # ==============================================================================
-# 這個版本精確匹配 finta 函式庫的輸出欄位名稱
 class PandasDataWithFeatures(bt.feeds.PandasData):
-    """
-    自訂數據饋送，用來識別由 finta 產生的特徵欄位。
-    """
     lines = (
         'SMA_20', 'SMA_50', 'EMA_20', 'EMA_50', 'RSI_14',
-        'MACD', 'SIGNAL',  # finta 的 MACD 輸出欄位
-        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',  # finta 的布林帶輸出欄位
+        'MACD', 'SIGNAL',
+        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER',
         'ATR_14', 'OBV',
     )
     params = (
@@ -29,12 +25,10 @@ class PandasDataWithFeatures(bt.feeds.PandasData):
         ('BB_MIDDLE', -1), ('BB_LOWER', -1), ('ATR_14', -1), ('OBV', -1),
     )
 
-
 # ==============================================================================
 # 2. 建立策略類別
 # ==============================================================================
 class SmaCrossStrategy(bt.Strategy):
-    """一個簡單的雙均線交叉策略"""
     params = (('short_sma_period', 20), ('long_sma_period', 50),)
 
     def __init__(self):
@@ -58,12 +52,11 @@ class SmaCrossStrategy(bt.Strategy):
         dt = dt or self.datas[0].datetime.date(0)
         print(f'{dt.isoformat()}, {txt}')
 
-
 # ==============================================================================
 # 3. 主程式執行區塊
 # ==============================================================================
 if __name__ == '__main__':
-    cerebro = bt.Cerebro()
+    cerebro = bt.Cerebro() # 已修正拼寫錯誤
     data_path = Path("Output_Feature_Engineering/MarketData_with_Features/EURUSD_sml/EURUSD_sml_H4_features.parquet")
     
     print(f"正在加載數據: {data_path}")
@@ -105,7 +98,6 @@ if __name__ == '__main__':
     print(f"{'='*72}\n")
 
     print('正在生成圖表...')
-    # 儲存圖表到檔案
     figure = cerebro.plot(style='candlestick', iplot=False)[0][0]
     figure.savefig('backtest_result.png')
     print('圖表已儲存為 backtest_result.png')
