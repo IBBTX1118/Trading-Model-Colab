@@ -6,11 +6,17 @@ from pathlib import Path
 class SmaCrossStrategy(bt.Strategy):
     params = (('short_sma', 20), ('long_sma', 50),)
 
+class SmaCrossStrategy(bt.Strategy):
+    params = (('short_sma', 20), ('long_sma', 50),)
+
     def __init__(self):
-        # 因為特徵已預先算好，我們直接從數據中引用
-        # 注意欄位名稱需與 .parquet 檔案中的完全一致
-        self.short_sma = self.data.lines._getline('SMA_' + str(self.p.short_sma))
-        self.long_sma = self.data.lines._getline('SMA_' + str(self.p.long_sma))
+        # 建立指標的完整欄位名稱
+        short_sma_name = 'SMA_' + str(self.p.short_sma)
+        long_sma_name = 'SMA_' + str(self.p.long_sma)
+
+        # 使用 getattr 這種更穩定的方式來按名稱獲取數據線
+        self.short_sma = getattr(self.data.lines, short_sma_name)
+        self.long_sma = getattr(self.data.lines, long_sma_name)
 
     def next(self):
         # 如果已有倉位，則暫不操作
