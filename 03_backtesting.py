@@ -1,5 +1,12 @@
 # 檔名: 03_backtesting.py
-# 版本: 2.0 (使用自訂 Data Feed)
+# 版本: 1.0 (正式版：使用 Backtrader)
+
+"""
+此腳本為策略回測階段。
+
+它會讀取由 02_feature_engineering.py 產生的、帶有特徵的 Parquet 檔案，
+然後使用 Backtrader 框架來執行一個簡單的交易策略，並輸出績效報告與圖表。
+"""
 
 import backtrader as bt
 import pandas as pd
@@ -8,7 +15,7 @@ from pathlib import Path
 # ==============================================================================
 # 1. 建立自訂數據饋送類別 (Custom Data Feed)
 # ==============================================================================
-# 我們繼承 bt.feeds.PandasData，並告訴它我們有哪些額外的欄位
+# 我們繼承 bt.feeds.PandasData，並告訴它我們有哪些額外的特徵欄位
 class PandasDataWithFeatures(bt.feeds.PandasData):
     """
     一個自訂的數據饋送，用來讓 Backtrader 識別我們預先計算好的特徵。
@@ -39,20 +46,24 @@ class SmaCrossStrategy(bt.Strategy):
 
     def __init__(self):
         # 現在可以直接透過 .lines.xxx 的方式來存取我們自訂的數據線
+        # 注意：這裡的名稱必須與 PandasDataWithFeatures 中 lines 定義的完全一致
         self.short_sma = self.data.lines.SMA_20
         self.long_sma = self.data.lines.SMA_50
         
-        # 也可以用 self.p.xxx 的方式讓參數更靈活，但直接存取更清晰
-        # short_sma_name = 'SMA_' + str(self.p.short_sma)
-        # self.short_sma = getattr(self.data.lines, short_sma_name)
+        # 使用 Backtrader 內建的交叉指標，讓邏輯更簡潔
+        self.crossover = bt.indicators.CrossOver(self.short_sma, self.long_sma)
 
     def next(self):
+        # 如果已有倉位
         if self.position:
-            if self.short_sma < self.long_sma:
+            # 如果出現死亡交叉 (短期均線下穿長期均線)，則平倉
+            if self.crossover < 0:
                 self.log('平倉 SELL')
                 self.close()
+        # 如果沒有倉位
         else:
-            if self.short_sma > self.long_sma:
+            # 如果出現黃金交叉 (短期均線上穿長期均線)，則進場
+            if self.crossover > 0:
                 self.log('進場 BUY')
                 self.buy()
 
@@ -66,32 +77,37 @@ class SmaCrossStrategy(bt.Strategy):
 # 3. 主程式執行區塊
 # ==============================================================================
 if __name__ == '__main__':
-    cerebro = bt.Cerebro()
+    cerebro = bt.Cerebro() # 建立 Cerebro 引擎
 
-    # 讀取帶有特徵的數據
+    # --- 數據加載 ---
+    # 您可以修改這個路徑來回測不同的商品或時間週期
     data_path = Path("Output_Feature_Engineering/EURUSD_sml/EURUSD_sml_H4_features.parquet")
+    
+    print(f"正在加載數據: {data_path}")
     df = pd.read_parquet(data_path)
-    df.index = pd.to_datetime(df.index)
+    df.index = pd.to_datetime(df.index) # 確保時間索引格式正確
 
-    # 關鍵：使用我們自訂的 PandasDataWithFeatures，而不是標準的 bt.feeds.PandasData
+    # 關鍵：使用我們自訂的 PandasDataWithFeatures
     data_feed = PandasDataWithFeatures(dataname=df)
     cerebro.adddata(data_feed)
 
+    # --- 策略與參數設定 ---
     cerebro.addstrategy(SmaCrossStrategy)
+    cerebro.broker.setcash(10000.0) # 設定初始資金
+    cerebro.broker.setcommission(commission=0.001) # 設定交易佣金 (例如千分之一)
 
-    cerebro.broker.setcash(10000.0)
-    cerebro.broker.setcommission(commission=0.001)
-
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio')
+    # --- 績效分析工具 ---
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
 
+    # --- 執行與結果打印 ---
     print('開始回測...')
     results = cerebro.run()
     strat = results[0]
     print('回測結束。')
 
-    # 打印績效
+    # 打印績效報告
     print(f"\n{'='*30} 績效報告 {'='*30}")
     print(f"初始資金: 10000.00")
     print(f"最終資產: {cerebro.broker.getvalue():.2f}")
@@ -100,15 +116,18 @@ if __name__ == '__main__':
     sharpe = strat.analyzers.sharpe_ratio.get_analysis()
     drawdown = strat.analyzers.drawdown.get_analysis()
 
-    if analysis.total.total > 0:
+    if hasattr(analysis, 'total') and analysis.total.total > 0:
         print(f"總交易次數: {analysis.total.total}")
         print(f"勝率: {analysis.won.total / analysis.total.total * 100:.2f}%")
     else:
         print("總交易次數: 0")
 
-    print(f"夏普比率: {sharpe.get('sharperatio', 'N/A')}")
+    print(f"夏普比率 (年化): {sharpe.get('sharperatio', 'N/A')}")
     print(f"最大回撤: {drawdown.max.drawdown:.2f}%")
-    print(f"{'='*70}\n")
+    print(f"{'='*72}\n")
 
     # 繪製績效圖
+    # 在 Colab 中，iplot=False 會將圖表儲存為 plot.png 檔案
+    print('正在生成圖表...')
     cerebro.plot(style='candlestick', iplot=False)
+    print('圖表已儲存為 plot.png')
