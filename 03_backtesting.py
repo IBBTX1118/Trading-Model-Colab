@@ -37,7 +37,7 @@ class DonchianATRStrategy(bt.Strategy):
         self.atr = self.data.lines.ATR_14
         
         # 使用 Backtrader 內建指標計算唐奇安通道
-        self.donchian = bt.indicators.DonchianChannels(
+        self.donchian = bt.indicators.DonchianChannel(
             self.data, period=self.p.donchian_period
         )
         
