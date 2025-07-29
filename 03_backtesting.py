@@ -46,12 +46,16 @@ class DonchianATRStrategy(bt.Strategy):
         if self.stop_loss_order or self.position:
             return
 
-        # 【關鍵修正】修改進場邏輯，參考手動建構的通道上軌
         if self.data.close[0] > self.donchian_high[-1]:
+            # --- 修正後的邏輯順序 ---
+            # 1. 先計算止損價格
             stop_price = self.data.close[0] - self.p.stop_loss_atr * self.atr[0]
+            # 2. 接著計算每單位風險
+            risk_per_unit = self.data.close[0] - stop_price
+            # 3. 然後才檢查每單位風險是否有效 (必須大於 0)
             if risk_per_unit <= 0:
                 return
-            risk_per_unit = self.data.close[0] - stop_price
+            # 4. 最後才計算倉位大小
             cash_to_risk = self.broker.getvalue() * self.p.risk_percent
             size = cash_to_risk / risk_per_unit
             
