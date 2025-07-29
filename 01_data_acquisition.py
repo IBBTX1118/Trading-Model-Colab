@@ -515,7 +515,7 @@ if __name__ == "__main__":
             "market_data_subfolder": "MarketData",
             "charts_subfolder": "Charts",
             "save_cleaned_data": True,
-            "generate_charts": True,
+            "generate_charts": False,
         },
         "mt5_connection": {
             "retry_attempts": 3,
@@ -524,11 +524,11 @@ if __name__ == "__main__":
             "delay_between_requests_seconds": 0.1,
         },
         "data_request": {
-            "start_year": 2022,
+            "start_year": 2021,
             "start_month": 1,
             "start_day": 1,
             # end_year/month/day 會自動設為當前日期
-            "symbol_list": ["EURUSD.sml", "USDJPY.sml", "GBPUSD.sml"],
+            "symbol_list": ["EURUSD.sml", "USDJPY.sml", "GBPUSD.sml", "AUDUSD.sml"],
             "timeframe_str_list": ["H1", "H4", "D1"],
             "strict_mode": True,
         },
