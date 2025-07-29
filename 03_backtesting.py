@@ -117,7 +117,7 @@ if __name__ == '__main__':
             df = pd.read_parquet(data_path)
             df.index = pd.to_datetime(df.index)
 
-            data_feed = PandasDataWithFeatures(datename=df)
+            data_feed = PandasDataWithFeatures(dataname=df)
             cerebro.adddata(data_feed)
 
             cerebro.addstrategy(DonchianATRStrategy)
