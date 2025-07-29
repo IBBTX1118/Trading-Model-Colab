@@ -1,7 +1,8 @@
 # 檔名: 03_backtesting.py
-# 版本: 4.1 (最終修正版：手動建構唐奇安通道)
+# 版本: 4.2 (最終整合版：修正倉位計算與繪圖問題)
 
 import matplotlib
+# 關鍵修正 #1：強制設定 matplotlib 使用無 GUI 的 'Agg' 後端
 matplotlib.use('Agg')
 
 import backtrader as bt
@@ -31,15 +32,8 @@ class DonchianATRStrategy(bt.Strategy):
 
     def __init__(self):
         self.atr = self.data.lines.ATR_14
-        
-        # 【關鍵修正】使用 Highest 和 Lowest 指標來手動建構唐奇安通道
-        self.donchian_high = bt.indicators.Highest(
-            self.data.high, period=self.p.donchian_period
-        )
-        self.donchian_low = bt.indicators.Lowest(
-            self.data.low, period=self.p.donchian_period
-        )
-        
+        self.donchian_high = bt.indicators.Highest(self.data.high, period=self.p.donchian_period)
+        self.donchian_low = bt.indicators.Lowest(self.data.low, period=self.p.donchian_period)
         self.stop_loss_order = None
 
     def next(self):
@@ -47,23 +41,20 @@ class DonchianATRStrategy(bt.Strategy):
             return
 
         if self.data.close[0] > self.donchian_high[-1]:
-            # --- 修正後的邏輯順序 ---
-            # 1. 先計算止損價格
             stop_price = self.data.close[0] - self.p.stop_loss_atr * self.atr[0]
-            # 2. 接著計算每單位風險
             risk_per_unit = self.data.close[0] - stop_price
-            # 3. 然後才檢查每單位風險是否有效 (必須大於 0)
+            
             if risk_per_unit <= 0:
                 return
-            # 4. 最後才計算倉位大小
+                
             cash_to_risk = self.broker.getvalue() * self.p.risk_percent
             size = cash_to_risk / risk_per_unit
             
-            self.log(f'進場 BUY, Size: {size:.2f}, Price: {self.data.close[0]:.5f}')
-            self.buy(size=size)
+            self.log(f'進場 BUY, Size: {int(size)}, Price: {self.data.close[0]:.5f}')
+            # 【關鍵修正 #2】將倉位大小轉換為整數
+            self.buy(size=int(size))
 
     def notify_order(self, order):
-        # ... (此函數內容與之前版本相同) ...
         if order.status in [order.Submitted, order.Accepted]:
             return
         if order.status in [order.Completed]:
@@ -71,23 +62,24 @@ class DonchianATRStrategy(bt.Strategy):
                 stop_price = order.executed.price - self.p.stop_loss_atr * self.atr[0]
                 self.log(f'BUY EXECUTED, Price: {order.executed.price:.5f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
                 self.log(f'設定止損單在: {stop_price:.5f}')
-                self.stop_loss_order = self.sell(exectype=bt.Order.Stop, price=stop_price)
+                self.stop_loss_order = self.sell(exectype=bt.Order.Stop, price=stop_price, size=order.executed.size)
             elif order.issell():
                 self.log(f'SELL EXECUTED, Price: {order.executed.price:.5f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log('訂單 Canceled/Margin/Rejected')
-        if order.status != order.Partial:
-             self.stop_loss_order = None
+        
+        self.stop_loss_order = None
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
         print(f'{dt.isoformat()}, {txt}')
 
 # ==============================================================================
-# 3. 主程式執行區塊 (與之前版本相同)
+# 3. 主程式執行區塊 (維持不變)
 # ==============================================================================
 if __name__ == '__main__':
-    # --- 迴圈測試設定 ---
+    # ... (主程式區塊與上一版完全相同，此處省略以保持簡潔) ...
+    # --- 定義要測試的商品與時間週期 ---
     symbols_to_test = ['EURUSD']
     timeframes_to_test = ['H1', 'H4', 'D1']
 
@@ -118,7 +110,6 @@ if __name__ == '__main__':
             results = cerebro.run()
             strat = results[0]
             
-            # --- 打印績效報告 ---
             print(f"\n----------- 績效報告: {symbol} - {timeframe} -----------")
             print(f"初始資金: 10000.00, 最終資產: {cerebro.broker.getvalue():.2f}")
             
@@ -132,7 +123,6 @@ if __name__ == '__main__':
             print(f"最大回撤: {strat.analyzers.drawdown.get_analysis().max.drawdown:.2f}%")
             print(f"{'-'*60}\n")
             
-            # --- 儲存圖表 ---
             figure = cerebro.plot(style='candlestick', iplot=False)[0][0]
             plot_filename = f'backtest_result_{symbol}_{timeframe}.png'
             figure.savefig(plot_filename)
