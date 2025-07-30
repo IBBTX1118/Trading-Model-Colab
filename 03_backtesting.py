@@ -1,6 +1,6 @@
 # 檔名: 03_feature_selection.py
 # 描述: 從龐大的特徵集中，利用 LightGBM 模型找出對預測目標最重要的特徵。
-# 版本: 1.0
+# 版本: 1.1 (彙總所有輸入檔案的特徵重要性，以提高穩健性)
 
 import logging
 import sys
@@ -85,31 +85,29 @@ class FeatureSelector:
         - 1: 上漲超過閾值 (我們想買入的訊號)
         - 0: 未上漲超過閾值
         """
-        self.logger.info(f"正在創建預測目標 (Label)... 向前看 {self.config.LABEL_LOOK_FORWARD_PERIODS} 根 K 棒，閾值 {self.config.LABEL_RETURN_THRESHOLD:.2%}")
+        self.logger.debug(f"正在創建預測目標 (Label)... 向前看 {self.config.LABEL_LOOK_FORWARD_PERIODS} 根 K 棒，閾值 {self.config.LABEL_RETURN_THRESHOLD:.2%}")
         
-        # 計算未來 N 期後的報酬率
         future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
-        
-        # 根據報酬率是否超過閾值來設定目標
         df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
         
         return df
 
-    def select_features(self, df: pd.DataFrame) -> List[str]:
+    def get_feature_importance_for_file(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        使用 LightGBM 模型訓練並選出最重要的特徵。
+        為單一 DataFrame 計算特徵重要性。
         """
         # 1. 準備數據
-        self.logger.info("準備特徵 (X) 和目標 (y)...")
+        self.logger.debug("準備特徵 (X) 和目標 (y)...")
         
-        # 排除非特徵欄位
-        non_feature_cols = ['open', 'high', 'low', 'close', 'tick_volume', 'target', 'time']
+        # 移除所有非特徵欄位，並確保特徵存在於 DataFrame 中
+        non_feature_cols = ['open', 'high', 'low', 'close', 'tick_volume', 'target', 'time', 'spread', 'real_volume']
         features = [col for col in df.columns if col not in non_feature_cols]
         
-        X = df[features]
-        y = df['target']
+        df_labeled = self.create_labels(df)
         
-        # 由於 shift 操作和指標計算會產生 NaN，需要移除
+        X = df_labeled[features]
+        y = df_labeled['target']
+        
         combined = pd.concat([X, y], axis=1)
         combined.dropna(inplace=True)
         
@@ -118,38 +116,28 @@ class FeatureSelector:
 
         if len(X) == 0:
             self.logger.warning("數據清洗後沒有剩餘樣本，無法進行特徵篩選。")
-            return []
+            return pd.DataFrame({'feature': [], 'importance': []})
 
         # 2. 訓練模型
-        self.logger.info(f"開始使用 LightGBM 訓練模型... 樣本數: {len(X)}")
+        self.logger.debug(f"開始使用 LightGBM 訓練模型... 樣本數: {len(X)}")
         model = lgb.LGBMClassifier(**self.config.LGBM_PARAMS)
         model.fit(X, y)
 
         # 3. 提取特徵重要性
-        self.logger.info("提取並排序特徵重要性...")
         feature_importances = pd.DataFrame({
             'feature': features,
             'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
+        })
         
-        self.logger.info("\n--- 特徵重要性排名 (前 30) ---\n" + feature_importances.head(30).to_string())
-
-        # 4. 選出最重要的 N 個特徵
-        top_features = feature_importances.head(self.config.TOP_N_FEATURES)['feature'].tolist()
-        self.logger.info(f"\n--- 已選出最重要的 {self.config.TOP_N_FEATURES} 個特徵 ---")
-        for f in top_features:
-            self.logger.info(f"- {f}")
-            
-        return top_features
+        return feature_importances
 
     def save_selected_features(self, features: List[str]) -> None:
         """將選出的特徵列表儲存為 JSON 檔案。"""
         output_path = self.config.OUTPUT_BASE_DIR / self.config.OUTPUT_FILENAME
         self.logger.info(f"正在將選出的特徵儲存到: {output_path}")
         
-        # 為了讓 JSON 檔案更具可讀性，我們儲存一個字典
         output_data = {
-            "description": "由 03_feature_selection.py 產生的最佳特徵列表",
+            "description": "由 03_feature_selection.py (v1.1) 產生的全域最佳特徵列表",
             "feature_count": len(features),
             "selected_features": features
         }
@@ -161,38 +149,45 @@ class FeatureSelector:
 
     def run(self) -> None:
         """執行完整特徵篩選流程。"""
-        self.logger.info("========= 特徵篩選流程開始 =========")
+        self.logger.info("========= 特徵篩選流程開始 (v1.1 - 彙總模式) =========")
         input_files = self.find_input_files()
         
         if not input_files:
             self.logger.warning("在輸入目錄中沒有找到任何檔案，流程結束。")
             return
 
-        # 為了簡化，我們先處理第一個找到的檔案。
-        # 在實際應用中，您可能需要合併多個檔案或循環處理它們。
-        target_file = input_files[0]
-        self.logger.info(f"--- 正在處理檔案: {target_file.name} ---")
+        all_importances = []
+        for file_path in input_files:
+            try:
+                self.logger.info(f"--- 正在處理檔案: {file_path.name} ---")
+                df = pd.read_parquet(file_path)
+                
+                # 為此檔案獲取特徵重要性
+                importance_df = self.get_feature_importance_for_file(df)
+                if not importance_df.empty:
+                    all_importances.append(importance_df)
+
+            except Exception as e:
+                self.logger.error(f"處理檔案 {file_path.name} 時發生錯誤: {e}", exc_info=True)
         
-        try:
-            df = pd.read_parquet(target_file)
+        if not all_importances:
+            self.logger.error("未能從任何檔案中成功計算特徵重要性，流程終止。")
+            return
             
-            # 步驟 1: 創建預測目標
-            df_with_target = self.create_labels(df)
-            
-            # 步驟 2: 進行特徵篩選
-            selected_features = self.select_features(df_with_target)
-            
-            if not selected_features:
-                self.logger.error("未能選出任何特徵，流程終止。")
-                return
+        # 彙總所有檔案的特徵重要性
+        self.logger.info("正在彙總所有檔案的特徵重要性...")
+        global_importance = pd.concat(all_importances).groupby('feature')['importance'].sum().sort_values(ascending=False)
+        
+        self.logger.info("\n--- 全域特徵重要性排名 (前 30) ---\n" + global_importance.head(30).to_string())
 
-            # 步驟 3: 儲存結果
-            self.save_selected_features(selected_features)
+        # 選出最重要的 N 個特徵
+        top_features = global_importance.head(self.config.TOP_N_FEATURES).index.tolist()
+        self.logger.info(f"\n--- 已選出全域最重要的 {self.config.TOP_N_FEATURES} 個特徵 ---")
+        for f in top_features:
+            self.logger.info(f"- {f}")
             
-            self.logger.info(f"--- 檔案 {target_file.name} 處理完畢 ---")
-
-        except Exception as e:
-            self.logger.error(f"處理檔案 {target_file.name} 時發生錯誤: {e}", exc_info=True)
+        # 儲存結果
+        self.save_selected_features(top_features)
             
         self.logger.info("========= 特徵篩選流程結束 =========")
 
