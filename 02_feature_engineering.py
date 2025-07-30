@@ -1,5 +1,5 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 2.0 (擴展指標版)
+# 版本: 2.1 (修復 'Other Series must have a name' 錯誤)
 
 """
 此腳本為特徵工程的擴展版。
@@ -70,6 +70,7 @@ class FeatureEngineer:
         }, inplace=True)
 
         # --- 計算所有 finta 指標 ---
+        
         # 趨勢指標 (Trend)
         df_finta['SMA_10'] = TA.SMA(df_finta, period=10)
         df_finta['SMA_20'] = TA.SMA(df_finta, period=20)
@@ -78,12 +79,14 @@ class FeatureEngineer:
         df_finta['EMA_20'] = TA.EMA(df_finta, period=20)
         df_finta['EMA_50'] = TA.EMA(df_finta, period=50)
         df_finta = df_finta.join(TA.DMI(df_finta))
-        df_finta = df_finta.join(TA.SAR(df_finta))
+        # *** FIX: 改為直接賦值以避免 'Other Series must have a name' 錯誤 ***
+        df_finta['SAR'] = TA.SAR(df_finta)
         
         # 動能指標 (Momentum)
         df_finta['RSI_14'] = TA.RSI(df_finta, period=14)
         df_finta = df_finta.join(TA.STOCH(df_finta))
         df_finta = df_finta.join(TA.MACD(df_finta))
+        # *** FIX: 改為直接賦值 ***
         df_finta['WILLIAMS'] = TA.WILLIAMS(df_finta)
         
         # 波動率指標 (Volatility)
@@ -91,10 +94,12 @@ class FeatureEngineer:
         df_finta['ATR_14'] = TA.ATR(df_finta, period=14)
         
         # 成交量指標 (Volume)
+        # *** FIX: 改為直接賦值 ***
         df_finta['OBV'] = TA.OBV(df_finta)
         df_finta['MFI'] = TA.MFI(df_finta)
         
         # 其他指標
+        # *** FIX: 改為直接賦值 ***
         df_finta['CCI'] = TA.CCI(df_finta)
         
         # 將 volume 欄位名稱改回 tick_volume
@@ -110,7 +115,11 @@ class FeatureEngineer:
             initial_cols = df.shape[1]
             df_with_features = self.add_features_to_dataframe(df)
             
+            # 在儲存前丟棄所有包含 NaN 的行
+            rows_before_dropna = len(df_with_features)
             df_with_features.dropna(inplace=True)
+            rows_after_dropna = len(df_with_features)
+            self.logger.info(f"移除了 {rows_before_dropna - rows_after_dropna} 行包含 NaN 的數據。")
             
             final_cols = df_with_features.shape[1]
             self.logger.info(f"成功添加了 {final_cols - initial_cols} 個新特徵。")
