@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 1.4 (修復 DMI 的 KeyError 並新增對 STOCH 的優化支持)
+# 版本: 1.5 (策略升級為雙均線交叉，以獲得更有效的參數評估)
 
 import logging
 import sys
@@ -47,7 +47,7 @@ class Config:
         'MACD_fast': (5, 30),
         'MACD_slow': (20, 80),
         'MACD_signal': (5, 30),
-        'DMI_period': (5, 50), # 注意: 鍵名是 DMI_period
+        'DMI_period': (5, 50),
         'BBANDS_period': (10, 50),
         'BBANDS_devfactor': (1.5, 3.5),
         'STOCH_k': (5, 20),
@@ -77,29 +77,30 @@ class MFIIndicator(bt.Indicator):
         self.lines.mfi = 100.0 - (100.0 / (1.0 + mr))
 
 # ==============================================================================
-# 3. Backtrader 策略 (用於 Optuna) - 已簡化
+# 3. Backtrader 策略 (用於 Optuna) - 已升級
 # ==============================================================================
 class OptunaStrategy(bt.Strategy):
     """
-    一個極其簡化的策略，專門用於評估單一指標參數的表現
+    *** NEW (v1.5): 升級為雙指標交叉策略 ***
+    這個策略使用兩條同類型但不同週期的指標（一快一慢），
+    在它們交叉時進行買賣，這是一個更穩健的參數評估基準。
     """
     params = (
-        ('indicator_class', None),
-        ('indicator_params', None),
+        ('fast_indicator', None),
+        ('slow_indicator', None),
     )
 
     def __init__(self):
-        if not self.p.indicator_class or self.p.indicator_params is None:
-            raise ValueError("必須提供指標類別和參數！")
+        if not self.p.fast_indicator or not self.p.slow_indicator:
+            raise ValueError("必須提供快速和慢速指標！")
         
-        self.the_indicator = self.p.indicator_class(self.data, **self.p.indicator_params)
-        self.crossover = bt.indicators.CrossOver(self.data.close, self.the_indicator)
+        self.crossover = bt.indicators.CrossOver(self.p.fast_indicator, self.p.slow_indicator)
 
     def next(self):
-        if self.crossover > 0:
+        if self.crossover > 0:  # 快線上穿慢線
             if not self.position:
                 self.buy()
-        elif self.crossover < 0:
+        elif self.crossover < 0:  # 快線下穿慢線
             if self.position:
                 self.sell()
 
@@ -149,78 +150,55 @@ class ParameterOptimizer:
         blueprints = {}
         unique_indicator_types = set()
         for feature in self.selected_features:
-            if feature in ['MACD', 'SIGNAL']:
-                unique_indicator_types.add('MACD')
-                continue
-            if feature in ['DI+', 'DI-']:
-                unique_indicator_types.add('DMI')
-                continue
-            if 'BB_' in feature:
-                unique_indicator_types.add('BBANDS')
-                continue
-            if 'STOCH' in feature:
-                unique_indicator_types.add('STOCH')
-                continue
-            match = re.match(r"([A-Z]+)", feature)
-            if match:
-                unique_indicator_types.add(match.group(1))
+            # *** NEW (v1.5): 只選擇適合做交叉策略的指標類型 ***
+            ind_type_match = re.match(r"([A-Z]+)", feature)
+            if ind_type_match:
+                ind_type = ind_type_match.group(1)
+                if ind_type in ['SMA', 'EMA']: # 暫時只專注於最經典的均線交叉
+                    unique_indicator_types.add(ind_type)
 
-        self.logger.info("已解析出以下需要優化的指標類型:")
+        self.logger.info("已解析出以下適合進行交叉策略優化的指標類型:")
         for ind_type in sorted(list(unique_indicator_types)):
-            if ind_type in self.config.PARAMETER_RANGES or any(key.startswith(ind_type) for key in self.config.PARAMETER_RANGES):
-                bt_class = self._get_bt_indicator_class(ind_type)
-                if bt_class:
-                    blueprints[ind_type] = bt_class
-                    self.logger.info(f"- {ind_type}")
+            bt_class = self._get_bt_indicator_class(ind_type)
+            if bt_class:
+                blueprints[ind_type] = bt_class
+                self.logger.info(f"- {ind_type}")
         return blueprints
 
     def _get_bt_indicator_class(self, name: str):
         mapping = {
-            'SMA': bt.indicators.SimpleMovingAverage, 'EMA': bt.indicators.ExponentialMovingAverage,
-            'RSI': bt.indicators.RSI, 'MACD': bt.indicators.MACD, 'CCI': bt.indicators.CCI,
-            'ATR': bt.indicators.ATR, 'BBANDS': bt.indicators.BollingerBands,
-            'STOCH': bt.indicators.Stochastic, 'WILLIAMS': bt.indicators.WilliamsR,
-            'MFI': MFIIndicator, 'DMI': bt.indicators.DMI,
+            'SMA': bt.indicators.SimpleMovingAverage, 
+            'EMA': bt.indicators.ExponentialMovingAverage,
         }
         return mapping.get(name.upper())
 
     def objective(self, trial: optuna.trial.Trial) -> float:
+        if not self.indicator_blueprints:
+             return -200.0 # 如果沒有可優化的指標，直接返回
+
         ind_type_to_optimize = trial.suggest_categorical("indicator_type", list(self.indicator_blueprints.keys()))
         ind_class = self.indicator_blueprints[ind_type_to_optimize]
         
-        current_params = {}
+        # *** NEW (v1.5): 為快線和慢線建議參數 ***
+        p_range_min, p_range_max = self.config.PARAMETER_RANGES[ind_type_to_optimize]
         
-        if ind_type_to_optimize in ['SMA', 'EMA', 'RSI', 'CCI', 'ATR', 'MFI', 'WILLIAMS', 'DMI']:
-            p_name = f"{ind_type_to_optimize}_period"
-            # *** FIX: 處理 'DMI' vs 'DMI_period' 的鍵名不一致問題 ***
-            range_key = p_name if p_name in self.config.PARAMETER_RANGES else ind_type_to_optimize
-            min_v, max_v = self.config.PARAMETER_RANGES[range_key]
-            current_params['period'] = trial.suggest_int(p_name, min_v, max_v)
-
-        elif ind_type_to_optimize == 'MACD':
-            p1 = trial.suggest_int('MACD_fast', *self.config.PARAMETER_RANGES['MACD_fast'])
-            p2 = trial.suggest_int('MACD_slow', *self.config.PARAMETER_RANGES['MACD_slow'])
-            p3 = trial.suggest_int('MACD_signal', *self.config.PARAMETER_RANGES['MACD_signal'])
-            if p2 <= p1: p2 = p1 + 1
-            current_params = {'period_me1': p1, 'period_me2': p2, 'period_signal': p3}
-            
-        elif ind_type_to_optimize == 'BBANDS':
-             period = trial.suggest_int('BBANDS_period', *self.config.PARAMETER_RANGES['BBANDS_period'])
-             dev = trial.suggest_float('BBANDS_devfactor', *self.config.PARAMETER_RANGES['BBANDS_devfactor'], step=0.1)
-             current_params = {'period': period, 'devfactor': dev}
+        # 建議快線週期
+        p_fast_name = f"{ind_type_to_optimize}_fast_period"
+        p_fast_val = trial.suggest_int(p_fast_name, p_range_min, p_range_max - 1)
         
-        # *** NEW: 新增對 STOCH 指標的處理 ***
-        elif ind_type_to_optimize == 'STOCH':
-            k = trial.suggest_int('STOCH_k', *self.config.PARAMETER_RANGES['STOCH_k'])
-            d = trial.suggest_int('STOCH_d', *self.config.PARAMETER_RANGES['STOCH_d'])
-            # Backtrader 的 Stochastic 指標參數名為 period (%K) 和 period_dfast (%D)
-            current_params = {'period': k, 'period_dfast': d}
-
-        if not current_params: return -100.0
+        # 建議慢線週期，確保它比快線長
+        p_slow_name = f"{ind_type_to_optimize}_slow_period"
+        p_slow_val = trial.suggest_int(p_slow_name, p_fast_val + 1, p_range_max)
 
         # --- 執行回測 ---
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.addstrategy(OptunaStrategy, indicator_class=ind_class, indicator_params=current_params)
+        
+        # 傳入實例化的指標，而不是類別
+        fast_indicator = ind_class(period=p_fast_val)
+        slow_indicator = ind_class(period=p_slow_val)
+        
+        cerebro.addstrategy(OptunaStrategy, fast_indicator=fast_indicator, slow_indicator=slow_indicator)
+        
         data_feed = bt.feeds.PandasData(dataname=self.df_data)
         cerebro.adddata(data_feed)
         cerebro.broker.setcash(self.config.INITIAL_CASH)
@@ -244,10 +222,10 @@ class ParameterOptimizer:
 
     def run(self) -> None:
         if not self.indicator_blueprints:
-            self.logger.error("沒有解析出任何可優化的指標。")
+            self.logger.error("沒有解析出任何適合進行交叉策略優化的指標 (如 SMA, EMA)。")
             return
 
-        self.logger.info(f"========= 參數優化流程開始 (v1.4) =========")
+        self.logger.info(f"========= 參數優化流程開始 (v1.5 - 雙均線交叉) =========")
         self.logger.info(f"優化目標: {self.config.OPTIMIZE_METRIC.upper()}")
 
         study = optuna.create_study(direction="maximize")
@@ -256,7 +234,7 @@ class ParameterOptimizer:
         self.logger.info("優化完成！")
         if study.best_value <= 0:
             self.logger.warning("警告：未能找到任何能產生正夏普比率的參數組合。")
-            self.logger.warning("這可能意味著單一指標交叉策略在該市場上無效，或者需要調整參數範圍。")
+            self.logger.warning("這可能意味著雙均線交叉策略在該市場上無效，或者需要調整參數範圍。")
         
         self.logger.info(f"最佳 Trial: {study.best_trial.number}")
         self.logger.info(f"最佳分數 ({self.config.OPTIMIZE_METRIC}): {study.best_value:.4f}")
@@ -270,7 +248,7 @@ class ParameterOptimizer:
         # 儲存最佳參數
         output_path = self.config.OUTPUT_BASE_DIR / self.config.OUTPUT_FILENAME
         output_data = {
-            "description": f"由 04_parameter_optimization.py 產生的最佳參數 (優化目標: {self.config.OPTIMIZE_METRIC})",
+            "description": f"由 04_parameter_optimization.py (v1.5) 產生的最佳參數 (優化目標: {self.config.OPTIMIZE_METRIC})",
             "best_value": study.best_value,
             "optimal_parameters": study.best_params
         }
