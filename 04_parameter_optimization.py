@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 1.3 (簡化策略邏輯以專注於參數評估，並強化回饋機制)
+# 版本: 1.4 (修復 DMI 的 KeyError 並新增對 STOCH 的優化支持)
 
 import logging
 import sys
@@ -37,7 +37,7 @@ class Config:
     
     # --- 參數搜索範圍 ---
     PARAMETER_RANGES = {
-        'SMA': (5, 200), # 擴大範圍以進行更廣泛的搜索
+        'SMA': (5, 200),
         'EMA': (5, 200),
         'RSI': (5, 50),
         'CCI': (5, 50),
@@ -47,7 +47,7 @@ class Config:
         'MACD_fast': (5, 30),
         'MACD_slow': (20, 80),
         'MACD_signal': (5, 30),
-        'DMI_period': (5, 50),
+        'DMI_period': (5, 50), # 注意: 鍵名是 DMI_period
         'BBANDS_period': (10, 50),
         'BBANDS_devfactor': (1.5, 3.5),
         'STOCH_k': (5, 20),
@@ -73,7 +73,6 @@ class MFIIndicator(bt.Indicator):
         mf_negative = bt.If(tp < tp(-1), mf, 0)
         mf_pos_sum = bt.indicators.SumN(mf_positive, period=self.p.period)
         mf_neg_sum = bt.indicators.SumN(mf_negative, period=self.p.period)
-        # *** FIX: 增加一個極小的數值 (epsilon) 來避免除以零的錯誤 ***
         mr = mf_pos_sum / (mf_neg_sum + 1e-9)
         self.lines.mfi = 100.0 - (100.0 / (1.0 + mr))
 
@@ -82,9 +81,7 @@ class MFIIndicator(bt.Indicator):
 # ==============================================================================
 class OptunaStrategy(bt.Strategy):
     """
-    *** NEW: 一個極其簡化的策略，專門用於評估單一指標參數的表現 ***
-    這個策略只使用一個指標（例如，一個移動平均線），並執行簡單的交叉買賣。
-    目的是為了確保能產生交易，從而有效地測試不同參數設定的優劣。
+    一個極其簡化的策略，專門用於評估單一指標參數的表現
     """
     params = (
         ('indicator_class', None),
@@ -95,17 +92,14 @@ class OptunaStrategy(bt.Strategy):
         if not self.p.indicator_class or self.p.indicator_params is None:
             raise ValueError("必須提供指標類別和參數！")
         
-        # 創建本次 trial 需要評估的單一指標
         self.the_indicator = self.p.indicator_class(self.data, **self.p.indicator_params)
-        
-        # 創建一個價格與指標的交叉信號
         self.crossover = bt.indicators.CrossOver(self.data.close, self.the_indicator)
 
     def next(self):
-        if self.crossover > 0:  # 價格上穿指標
+        if self.crossover > 0:
             if not self.position:
                 self.buy()
-        elif self.crossover < 0:  # 價格下穿指標
+        elif self.crossover < 0:
             if self.position:
                 self.sell()
 
@@ -191,28 +185,37 @@ class ParameterOptimizer:
         return mapping.get(name.upper())
 
     def objective(self, trial: optuna.trial.Trial) -> float:
-        # *** NEW: 在每個 trial 中，只選擇一個指標類型進行測試 ***
-        # 這能讓我們獨立地評估每個指標的最佳參數，避免不同指標間的相互干擾。
         ind_type_to_optimize = trial.suggest_categorical("indicator_type", list(self.indicator_blueprints.keys()))
         ind_class = self.indicator_blueprints[ind_type_to_optimize]
         
         current_params = {}
-        # 根據選擇的指標類型，生成對應的參數
+        
         if ind_type_to_optimize in ['SMA', 'EMA', 'RSI', 'CCI', 'ATR', 'MFI', 'WILLIAMS', 'DMI']:
             p_name = f"{ind_type_to_optimize}_period"
-            min_v, max_v = self.config.PARAMETER_RANGES[ind_type_to_optimize]
+            # *** FIX: 處理 'DMI' vs 'DMI_period' 的鍵名不一致問題 ***
+            range_key = p_name if p_name in self.config.PARAMETER_RANGES else ind_type_to_optimize
+            min_v, max_v = self.config.PARAMETER_RANGES[range_key]
             current_params['period'] = trial.suggest_int(p_name, min_v, max_v)
+
         elif ind_type_to_optimize == 'MACD':
             p1 = trial.suggest_int('MACD_fast', *self.config.PARAMETER_RANGES['MACD_fast'])
             p2 = trial.suggest_int('MACD_slow', *self.config.PARAMETER_RANGES['MACD_slow'])
             p3 = trial.suggest_int('MACD_signal', *self.config.PARAMETER_RANGES['MACD_signal'])
             if p2 <= p1: p2 = p1 + 1
             current_params = {'period_me1': p1, 'period_me2': p2, 'period_signal': p3}
+            
         elif ind_type_to_optimize == 'BBANDS':
              period = trial.suggest_int('BBANDS_period', *self.config.PARAMETER_RANGES['BBANDS_period'])
              dev = trial.suggest_float('BBANDS_devfactor', *self.config.PARAMETER_RANGES['BBANDS_devfactor'], step=0.1)
              current_params = {'period': period, 'devfactor': dev}
         
+        # *** NEW: 新增對 STOCH 指標的處理 ***
+        elif ind_type_to_optimize == 'STOCH':
+            k = trial.suggest_int('STOCH_k', *self.config.PARAMETER_RANGES['STOCH_k'])
+            d = trial.suggest_int('STOCH_d', *self.config.PARAMETER_RANGES['STOCH_d'])
+            # Backtrader 的 Stochastic 指標參數名為 period (%K) 和 period_dfast (%D)
+            current_params = {'period': k, 'period_dfast': d}
+
         if not current_params: return -100.0
 
         # --- 執行回測 ---
@@ -232,10 +235,9 @@ class ParameterOptimizer:
             return -100.0
 
         # --- 提取結果 ---
-        # *** FIX: 強化回饋機制 ***
         trades = strat.analyzers.trades.get_analysis()
         if trades.total.total == 0:
-            return -100.0  # 如果沒有交易，給予一個很大的負分
+            return -100.0
             
         sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0.0)
         return sharpe if sharpe is not None else -100.0
@@ -245,7 +247,7 @@ class ParameterOptimizer:
             self.logger.error("沒有解析出任何可優化的指標。")
             return
 
-        self.logger.info(f"========= 參數優化流程開始 (v1.3) =========")
+        self.logger.info(f"========= 參數優化流程開始 (v1.4) =========")
         self.logger.info(f"優化目標: {self.config.OPTIMIZE_METRIC.upper()}")
 
         study = optuna.create_study(direction="maximize")
@@ -259,7 +261,6 @@ class ParameterOptimizer:
         self.logger.info(f"最佳 Trial: {study.best_trial.number}")
         self.logger.info(f"最佳分數 ({self.config.OPTIMIZE_METRIC}): {study.best_value:.4f}")
         self.logger.info("最佳參數:")
-        # *** NEW: 整理輸出，只顯示與最佳指標相關的參數 ***
         best_indicator = study.best_params.get("indicator_type")
         self.logger.info(f"  - 最佳指標類型: {best_indicator}")
         for key, value in study.best_params.items():
