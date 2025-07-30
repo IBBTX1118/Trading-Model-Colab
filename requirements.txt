@@ -1,12 +1,9 @@
+# 專為 Google Colab 雲端環境
 # 基礎數據處理
 pandas
 pyarrow
 finta
 setuptools
-
-# 數據獲取 (本地端)
-MetaTrader5
-pydantic
 
 # 機器學習與特徵篩選
 scikit-learn
