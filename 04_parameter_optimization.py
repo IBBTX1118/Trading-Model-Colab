@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 1.1 (支援解析多種特徵名稱)
+# 版本: 1.2 (新增自定義 MFI 指標，修復 AttributeError)
 
 import logging
 import sys
@@ -62,7 +62,38 @@ class Config:
     LOG_LEVEL = "INFO"
 
 # ==============================================================================
-# 2. Backtrader 策略 (用於 Optuna)
+# 2. 自定義指標 (MFI)
+# ==============================================================================
+class MFIIndicator(bt.Indicator):
+    """
+    自定義的資金流量指標 (Money Flow Index)
+    """
+    lines = ('mfi',)
+    params = (('period', 14),)
+
+    def __init__(self):
+        # 計算典型價格 (Typical Price)
+        tp = (self.data.close + self.data.high + self.data.low) / 3.0
+        # 計算資金流量 (Money Flow)
+        mf = tp * self.data.volume
+
+        # 比較今天和昨天的典型價格
+        mf_positive = bt.If(tp > tp(-1), mf, 0)
+        mf_negative = bt.If(tp < tp(-1), mf, 0)
+        
+        # 計算 N 週期的正負資金流量總和
+        mf_pos_sum = bt.indicators.SumN(mf_positive, period=self.p.period)
+        mf_neg_sum = bt.indicators.SumN(mf_negative, period=self.p.period)
+
+        # 計算資金比率 (Money Ratio)
+        mr = mf_pos_sum / mf_neg_sum
+        
+        # 計算 MFI
+        self.lines.mfi = 100.0 - (100.0 / (1.0 + mr))
+
+
+# ==============================================================================
+# 3. Backtrader 策略 (用於 Optuna)
 # ==============================================================================
 class OptunaStrategy(bt.Strategy):
     """
@@ -82,7 +113,7 @@ class OptunaStrategy(bt.Strategy):
         for name, p_config in self.p.indicator_params.items():
             bt_indicator_class = p_config['class']
             params_dict = p_config['params']
-            self.inds[name] = bt_indicator_class(**params_dict)
+            self.inds[name] = bt_indicator_class(self.data, **params_dict)
 
         # 為了簡化，我們假設第一個 EMA/SMA 是趨勢指標
         # 第二個 RSI/CCI 是震盪指標
@@ -94,7 +125,7 @@ class OptunaStrategy(bt.Strategy):
             if 'EMA' in name.upper() or 'SMA' in name.upper():
                 if self.trend_indicator is None:
                     self.trend_indicator = ind
-            if 'RSI' in name.upper() or 'CCI' in name.upper() or 'WILLIAMS' in name.upper():
+            if 'RSI' in name.upper() or 'CCI' in name.upper() or 'WILLIAMS' in name.upper() or 'MFI' in name.upper():
                  if self.oscillator is None:
                     self.oscillator = ind
         
@@ -117,7 +148,7 @@ class OptunaStrategy(bt.Strategy):
                 self.sell()
 
 # ==============================================================================
-# 3. 參數優化器類別
+# 4. 參數優化器類別
 # ==============================================================================
 class ParameterOptimizer:
     def __init__(self, config: Config):
@@ -160,6 +191,8 @@ class ParameterOptimizer:
         self.logger.info(f"正在從 {self.config.INPUT_DATA_FILE} 載入回測數據...")
         df = pd.read_parquet(self.config.INPUT_DATA_FILE)
         df.index = pd.to_datetime(df.index)
+        # Backtrader 需要特定的欄位名稱
+        df.rename(columns={'tick_volume': 'volume'}, inplace=True)
         return df
 
     def _parse_feature_blueprints(self) -> Dict:
@@ -194,8 +227,10 @@ class ParameterOptimizer:
         for ind_type in sorted(list(unique_indicator_types)):
              # 確保該指標類型在我們的參數範圍定義中
             if ind_type in self.config.PARAMETER_RANGES or f"{ind_type}_period" in self.config.PARAMETER_RANGES or f"{ind_type}_fast" in self.config.PARAMETER_RANGES:
-                blueprints[ind_type] = self._get_bt_indicator_class(ind_type)
-                self.logger.info(f"- {ind_type}")
+                bt_class = self._get_bt_indicator_class(ind_type)
+                if bt_class:
+                    blueprints[ind_type] = bt_class
+                    self.logger.info(f"- {ind_type}")
         
         return blueprints
 
@@ -211,11 +246,8 @@ class ParameterOptimizer:
             'BBANDS': bt.indicators.BollingerBands,
             'STOCH': bt.indicators.Stochastic,
             'WILLIAMS': bt.indicators.WilliamsR,
-            'MFI': bt.indicators.MFI,
+            'MFI': MFIIndicator, # *** FIX: 指向我們自定義的 MFI 指標 ***
             'DMI': bt.indicators.DMI, # DI+ 和 DI- 都從 DMI 計算而來
-            # 注意：OBV, SAR 在 backtrader 中沒有直接對應的內建指標，
-            # 如果需要優化它們，需要自定義指標或在策略中手動計算。
-            # 為簡化起見，此版本暫不優化它們。
         }
         return mapping.get(name.upper())
 
@@ -231,14 +263,14 @@ class ParameterOptimizer:
             current_params = {}
             if ind_type in ['SMA', 'EMA', 'RSI', 'CCI', 'ATR', 'MFI', 'WILLIAMS', 'DMI']:
                 p_name = f"{ind_type}_period"
-                min_v, max_v = self.config.PARAMETER_RANGES.get(ind_type, self.config.PARAMETER_RANGES.get(f"{ind_type}_period"))
+                range_key = ind_type if ind_type in self.config.PARAMETER_RANGES else f"{ind_type}_period"
+                min_v, max_v = self.config.PARAMETER_RANGES[range_key]
                 current_params['period'] = trial.suggest_int(p_name, min_v, max_v)
 
             elif ind_type == 'MACD':
                 p1 = trial.suggest_int('MACD_fast', *self.config.PARAMETER_RANGES['MACD_fast'])
                 p2 = trial.suggest_int('MACD_slow', *self.config.PARAMETER_RANGES['MACD_slow'])
                 p3 = trial.suggest_int('MACD_signal', *self.config.PARAMETER_RANGES['MACD_signal'])
-                # 確保 slow > fast
                 if p2 <= p1: p2 = p1 + 1
                 current_params = {'period_me1': p1, 'period_me2': p2, 'period_signal': p3}
 
@@ -251,10 +283,10 @@ class ParameterOptimizer:
                  indicator_params_for_strategy[ind_type] = {'class': ind_class, 'params': current_params}
 
         if not indicator_params_for_strategy:
-            return -1.0 # 如果沒有可優化的指標，返回一個差的分數
+            return -1.0
 
         # --- 執行回測 ---
-        cerebro = bt.Cerebro(stdstats=False) # 關閉預設的 print 輸出
+        cerebro = bt.Cerebro(stdstats=False)
         cerebro.addstrategy(OptunaStrategy, indicator_params=indicator_params_for_strategy)
         
         data_feed = bt.feeds.PandasData(dataname=self.df_data)
