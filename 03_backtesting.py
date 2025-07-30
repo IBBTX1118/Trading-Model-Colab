@@ -91,7 +91,7 @@ def run_backtest(symbol):
     cerebro.broker.setcash(initial_cash)
     cerebro.broker.setcommission(commission=0.001)
 
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days, annualization=252)
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
 
