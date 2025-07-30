@@ -1,168 +1,206 @@
-# 檔名: 03_backtesting.py
-# 版本: 6.2 (最終穩定版：修正獲利因子計算)
+# 檔名: 03_feature_selection.py
+# 描述: 從龐大的特徵集中，利用 LightGBM 模型找出對預測目標最重要的特徵。
+# 版本: 1.0
 
-"""
-此腳本為策略回測的最終穩定版。
-
-功能：
-1. 使用 multiprocessing 並行處理，加速多商品回測。
-2. 迴圈測試多個指定商品。
-3. 完全移除繪圖功能，避免任何潛在的環境衝突。
-4. 修正了訂單狀態管理與績效計算邏輯，確保程式穩健運行。
-5. 最終以表格形式，彙總並打印所有商品的回測績效報告。
-"""
-
-import backtrader as bt
-import pandas as pd
+import logging
+import sys
+import json
 from pathlib import Path
-import multiprocessing
-import time
+from typing import List, Tuple, Dict
+
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
 
 # ==============================================================================
-# 1. 自訂數據饋送類別
+# 1. 配置區塊
 # ==============================================================================
-class PandasDataWithFeatures(bt.feeds.PandasData):
-    lines = ('SMA_20', 'SMA_50', 'EMA_20', 'EMA_50', 'RSI_14', 'MACD', 
-             'SIGNAL', 'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'ATR_14', 'OBV',)
-    params = (('SMA_20', -1), ('SMA_50', -1), ('EMA_20', -1), ('EMA_50', -1), 
-              ('RSI_14', -1), ('MACD', -1), ('SIGNAL', -1), ('BB_UPPER', -1), 
-              ('BB_MIDDLE', -1), ('BB_LOWER', -1), ('ATR_14', -1), ('OBV', -1),)
-
-# ==============================================================================
-# 2. 策略類別
-# ==============================================================================
-class DonchianATRStrategy(bt.Strategy):
-    params = (
-        ('donchian_period', 20),
-        ('atr_period', 14),
-        ('stop_loss_atr', 1.5),
-        ('risk_percent', 0.01),
-        ('verbose', False),
-    )
-
-    def __init__(self):
-        self.atr = self.data.lines.ATR_14
-        self.donchian_high = bt.indicators.Highest(self.data.high, period=self.p.donchian_period)
-        self.buy_order = None
-        self.stop_loss_order = None
-
-    def next(self):
-        if self.buy_order or self.stop_loss_order or self.position:
-            return
-
-        if self.data.close[0] > self.donchian_high[-1]:
-            stop_price = self.data.close[0] - self.p.stop_loss_atr * self.atr[0]
-            risk_per_unit = self.data.close[0] - stop_price
-            
-            if risk_per_unit <= 0: return
-                
-            cash_to_risk = self.broker.getvalue() * self.p.risk_percent
-            size = cash_to_risk / risk_per_unit
-            
-            self.buy_order = self.buy(size=int(size))
-
-    def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-
-        if order.status in [order.Completed]:
-            if order.isbuy():
-                stop_price = order.executed.price - self.p.stop_loss_atr * self.atr[0]
-                self.stop_loss_order = self.sell(exectype=bt.Order.Stop, price=stop_price, size=order.executed.size)
-        
-        if order == self.buy_order:
-            self.buy_order = None
-        elif order == self.stop_loss_order:
-            self.stop_loss_order = None
-
-# ==============================================================================
-# 3. 獨立的回測執行函數
-# ==============================================================================
-def run_backtest(symbol):
-    cerebro = bt.Cerebro(stdstats=False)
-
-    data_path = Path(f"Output_Feature_Engineering/MarketData_with_Features/{symbol}_sml/{symbol}_sml_H4_features.parquet")
+class Config:
+    """儲存腳本所需的所有配置參數。"""
+    # 輸入目錄：來自 02_feature_engineering.py 的輸出
+    INPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_All_Features")
     
-    if not data_path.exists():
-        print(f"數據檔案不存在: {data_path}，跳過 {symbol}。")
-        return None
+    # 輸出目錄：儲存機器學習流程的產出
+    OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
+    OUTPUT_FILENAME = "selected_features.json"
 
-    df = pd.read_parquet(data_path)
-    df.index = pd.to_datetime(df.index)
+    # --- Labeling (目標定義) 相關參數 ---
+    # 預測未來幾根 K 棒
+    LABEL_LOOK_FORWARD_PERIODS: int = 5
+    # 目標報酬率閾值 (例如：0.5% -> 0.005)
+    LABEL_RETURN_THRESHOLD: float = 0.005
 
-    data_feed = PandasDataWithFeatures(dataname=df)
-    data_feed._name = symbol
-    cerebro.adddata(data_feed)
-
-    cerebro.addstrategy(DonchianATRStrategy)
-    
-    initial_cash = 10000.0
-    cerebro.broker.setcash(initial_cash)
-    cerebro.broker.setcommission(commission=0.001)
-
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days)
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
-
-    results = cerebro.run()
-    strat = results[0]
-    
-    final_value = cerebro.broker.getvalue()
-    pnl = final_value - initial_cash
-    
-    analysis_trade = strat.analyzers.trade_analyzer.get_analysis()
-    analysis_sharpe = strat.analyzers.sharpe_ratio.get_analysis()
-    analysis_drawdown = strat.analyzers.drawdown.get_analysis()
-
-    total_trades = analysis_trade.total.total if hasattr(analysis_trade, 'total') else 0
-    win_rate = (analysis_trade.won.total / total_trades * 100) if total_trades > 0 and hasattr(analysis_trade, 'won') else 0
-    
-    # 【關鍵修正】更穩健的獲利因子計算方式
-    if hasattr(analysis_trade, 'pnl') and hasattr(analysis_trade.pnl, 'gross'):
-        gross_profit = analysis_trade.pnl.gross.total
-        # 使用 .get() 安全地獲取虧損值，如果不存在則預設為 0
-        gross_loss = abs(analysis_trade.pnl.net.get('lost', 0.0))
-        if gross_loss > 0:
-            profit_factor = gross_profit / gross_loss
-        else:
-            profit_factor = float('inf')  # 如果沒有虧損，獲利因子為無限大
-    else:
-        profit_factor = 0.0
-
-    performance_dict = {
-        "商品 (Symbol)": symbol,
-        "最終資產 (Final Value)": f"{final_value:,.2f}",
-        "淨損益 (Net PnL)": f"{pnl:,.2f}",
-        "總報酬率 (Total Return %)": f"{(pnl / initial_cash) * 100:.2f}",
-        "夏普比率 (Annualized Sharpe)": f"{analysis_sharpe.get('sharperatio', 0):.2f}",
-        "最大回撤 (Max Drawdown %)": f"{analysis_drawdown.max.drawdown:.2f}",
-        "總交易次數 (Total Trades)": total_trades,
-        "勝率 (Win Rate %)": f"{win_rate:.2f}",
-        "獲利因子 (Profit Factor)": f"{profit_factor:.2f}",
+    # --- 模型與特徵篩選相關參數 ---
+    # 要選擇最重要的前 N 個特徵
+    TOP_N_FEATURES: int = 20
+    # LightGBM 模型參數
+    LGBM_PARAMS = {
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'boosting_type': 'gbdt',
+        'n_estimators': 200,
+        'learning_rate': 0.05,
+        'num_leaves': 31,
+        'max_depth': -1,
+        'seed': 42,
+        'n_jobs': -1,
+        'verbose': -1,
     }
-    return performance_dict
+    
+    LOG_LEVEL = "INFO"
 
 # ==============================================================================
-# 4. 主程式執行區塊
+# 2. 特徵篩選器類別
 # ==============================================================================
-if __name__ == '__main__':
-    symbols_to_test = ['EURUSD', 'USDJPY', 'GBPUSD', 'AUDUSD']
-    
-    print(f"準備對 {len(symbols_to_test)} 個商品進行並行回測...")
-    start_time = time.time()
+class FeatureSelector:
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = self._setup_logger()
+        self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        results = pool.map(run_backtest, symbols_to_test)
+    def _setup_logger(self) -> logging.Logger:
+        """設定日誌記錄器。"""
+        logger = logging.getLogger(self.__class__.__name__)
+        logger.setLevel(self.config.LOG_LEVEL.upper())
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(formatter)
+        logger.addHandler(sh)
+        return logger
 
-    end_time = time.time()
-    print(f"所有回測執行完畢，總耗時: {end_time - start_time:.2f} 秒")
+    def find_input_files(self) -> List[Path]:
+        """尋找輸入的 Parquet 檔案。"""
+        self.logger.info(f"從 '{self.config.INPUT_BASE_DIR}' 尋找輸入檔案...")
+        files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
+        self.logger.info(f"找到了 {len(files)} 個 Parquet 檔案。")
+        return files
 
-    valid_results = [res for res in results if res is not None]
-    
-    if valid_results:
-        performance_df = pd.DataFrame(valid_results)
-        performance_df.set_index("商品 (Symbol)", inplace=True)
+    def create_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        定義並創建預測目標 (Label)。
+        目標：預測未來 N 根 K 棒後的收盤價是否上漲超過一個閾值。
+        - 1: 上漲超過閾值 (我們想買入的訊號)
+        - 0: 未上漲超過閾值
+        """
+        self.logger.info(f"正在創建預測目標 (Label)... 向前看 {self.config.LABEL_LOOK_FORWARD_PERIODS} 根 K 棒，閾值 {self.config.LABEL_RETURN_THRESHOLD:.2%}")
         
-        print("\n" + "="*35 + " 綜合績效報告 " + "="*35)
-        print(performance_df)
-        print("="*105)
+        # 計算未來 N 期後的報酬率
+        future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
+        
+        # 根據報酬率是否超過閾值來設定目標
+        df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
+        
+        return df
+
+    def select_features(self, df: pd.DataFrame) -> List[str]:
+        """
+        使用 LightGBM 模型訓練並選出最重要的特徵。
+        """
+        # 1. 準備數據
+        self.logger.info("準備特徵 (X) 和目標 (y)...")
+        
+        # 排除非特徵欄位
+        non_feature_cols = ['open', 'high', 'low', 'close', 'tick_volume', 'target', 'time']
+        features = [col for col in df.columns if col not in non_feature_cols]
+        
+        X = df[features]
+        y = df['target']
+        
+        # 由於 shift 操作和指標計算會產生 NaN，需要移除
+        combined = pd.concat([X, y], axis=1)
+        combined.dropna(inplace=True)
+        
+        X = combined[features]
+        y = combined['target']
+
+        if len(X) == 0:
+            self.logger.warning("數據清洗後沒有剩餘樣本，無法進行特徵篩選。")
+            return []
+
+        # 2. 訓練模型
+        self.logger.info(f"開始使用 LightGBM 訓練模型... 樣本數: {len(X)}")
+        model = lgb.LGBMClassifier(**self.config.LGBM_PARAMS)
+        model.fit(X, y)
+
+        # 3. 提取特徵重要性
+        self.logger.info("提取並排序特徵重要性...")
+        feature_importances = pd.DataFrame({
+            'feature': features,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        self.logger.info("\n--- 特徵重要性排名 (前 30) ---\n" + feature_importances.head(30).to_string())
+
+        # 4. 選出最重要的 N 個特徵
+        top_features = feature_importances.head(self.config.TOP_N_FEATURES)['feature'].tolist()
+        self.logger.info(f"\n--- 已選出最重要的 {self.config.TOP_N_FEATURES} 個特徵 ---")
+        for f in top_features:
+            self.logger.info(f"- {f}")
+            
+        return top_features
+
+    def save_selected_features(self, features: List[str]) -> None:
+        """將選出的特徵列表儲存為 JSON 檔案。"""
+        output_path = self.config.OUTPUT_BASE_DIR / self.config.OUTPUT_FILENAME
+        self.logger.info(f"正在將選出的特徵儲存到: {output_path}")
+        
+        # 為了讓 JSON 檔案更具可讀性，我們儲存一個字典
+        output_data = {
+            "description": "由 03_feature_selection.py 產生的最佳特徵列表",
+            "feature_count": len(features),
+            "selected_features": features
+        }
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=4)
+        
+        self.logger.info("特徵列表儲存成功。")
+
+    def run(self) -> None:
+        """執行完整特徵篩選流程。"""
+        self.logger.info("========= 特徵篩選流程開始 =========")
+        input_files = self.find_input_files()
+        
+        if not input_files:
+            self.logger.warning("在輸入目錄中沒有找到任何檔案，流程結束。")
+            return
+
+        # 為了簡化，我們先處理第一個找到的檔案。
+        # 在實際應用中，您可能需要合併多個檔案或循環處理它們。
+        target_file = input_files[0]
+        self.logger.info(f"--- 正在處理檔案: {target_file.name} ---")
+        
+        try:
+            df = pd.read_parquet(target_file)
+            
+            # 步驟 1: 創建預測目標
+            df_with_target = self.create_labels(df)
+            
+            # 步驟 2: 進行特徵篩選
+            selected_features = self.select_features(df_with_target)
+            
+            if not selected_features:
+                self.logger.error("未能選出任何特徵，流程終止。")
+                return
+
+            # 步驟 3: 儲存結果
+            self.save_selected_features(selected_features)
+            
+            self.logger.info(f"--- 檔案 {target_file.name} 處理完畢 ---")
+
+        except Exception as e:
+            self.logger.error(f"處理檔案 {target_file.name} 時發生錯誤: {e}", exc_info=True)
+            
+        self.logger.info("========= 特徵篩選流程結束 =========")
+
+if __name__ == "__main__":
+    try:
+        config = Config()
+        selector = FeatureSelector(config)
+        selector.run()
+    except Exception as e:
+        logging.critical(f"特徵篩選腳本執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
+        sys.exit(1)
