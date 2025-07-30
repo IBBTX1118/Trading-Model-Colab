@@ -1,8 +1,20 @@
-pydantic
-pyarrow
-seaborn
+# 基礎數據處理
 pandas
+pyarrow
 finta
 setuptools
+
+# 數據獲取 (本地端)
+MetaTrader5
+pydantic
+
+# 機器學習與特徵篩選
+scikit-learn
+lightgbm
+
+# 參數優化
+optuna
+
+# 回測框架
 backtrader
 matplotlib
