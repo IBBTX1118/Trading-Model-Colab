@@ -1,5 +1,5 @@
 # 檔名: 04_backtesting_MA_Cross.py
-# 版本: 1.0 (基礎模型：雙均線交叉)
+# 版本: 1.1 (基礎模型：修正 dataname 拼寫錯誤)
 
 """
 此腳本為一個全新的基礎模型，基於雙指數移動平均線 (EMA) 交叉策略。
@@ -103,7 +103,8 @@ if __name__ == '__main__':
     df = pd.read_parquet(data_path)
     df.index = pd.to_datetime(df.index)
 
-    data_feed = PandasDataWithFeatures(datename=df)
+    # 【關鍵修正】將 datename 修正為 dataname
+    data_feed = PandasDataWithFeatures(dataname=df)
     cerebro.adddata(data_feed)
 
     cerebro.addstrategy(MACrossoverStrategy)
