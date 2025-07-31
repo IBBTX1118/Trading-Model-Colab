@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.2 (修正最終報告的格式化錯誤並消除 UserWarning)
+# 版本: 3.3 (修正因數據中存在 inf 值導致的繪圖錯誤)
 
 import logging
 import sys
@@ -63,7 +63,6 @@ class FinalMLStrategy(bt.Strategy):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         
-        # 為每個特徵創建一個引用，方便在 next 方法中使用
         self.feature_lines = []
         for feature_name in self.p.features:
             self.feature_lines.append(getattr(self.data.lines, feature_name))
@@ -71,11 +70,9 @@ class FinalMLStrategy(bt.Strategy):
     def next(self):
         feature_vector = []
         try:
-            # 從每個特徵的 line 中獲取當前 K 棒的值
             for line in self.feature_lines:
                 feature_vector.append(line[0])
         except IndexError:
-            # 數據還不夠長，無法形成完整的特徵向量
             return
 
         feature_vector = np.array(feature_vector).reshape(1, -1)
@@ -134,15 +131,17 @@ class MLOptimizerAndBacktester:
         df = pd.concat(all_dfs).sort_index()
         self.logger.info(f"已合併 {len(input_files)} 個檔案，共 {len(df)} 筆數據。")
 
-        # 創建 Label
         future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
         df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
         
-        # 確保 selected_features 中的欄位存在
         missing_features = [f for f in self.selected_features if f not in df.columns]
         if missing_features:
             self.logger.warning(f"數據中缺少以下特徵，將被忽略: {missing_features}")
             self.selected_features = [f for f in self.selected_features if f in df.columns]
+
+        # *** NEW (v3.3): 清理無窮大值，以防止繪圖錯誤 ***
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        self.logger.info("已將數據中的無窮大值替換為 NaN。")
 
         df.dropna(inplace=True)
         return df
@@ -163,7 +162,6 @@ class MLOptimizerAndBacktester:
         }
 
         model = lgb.LGBMClassifier(**param)
-        # *** FIX (v3.2): 使用 .values 將 DataFrame 轉為 NumPy array 以消除警告 ***
         model.fit(self.X_train.values, self.y_train.values)
         
         preds = model.predict(self.X_val.values)
@@ -172,7 +170,7 @@ class MLOptimizerAndBacktester:
 
     def run(self):
         """執行完整的優化與回測流程。"""
-        self.logger.info("========= 整合式優化與回測流程開始 (v3.2) =========")
+        self.logger.info("========= 整合式優化與回測流程開始 (v3.3) =========")
 
         # 1. 數據分割
         df_in_sample = self.full_df[self.full_df.index < self.config.OUT_OF_SAMPLE_START_DATE]
@@ -245,7 +243,6 @@ class MLOptimizerAndBacktester:
         self.logger.info(f"最終資產價值: {cerebro.broker.getvalue():,.2f}")
         self.logger.info(f"總淨利: {trades.pnl.net.total:,.2f}")
         
-        # *** FIX (v3.2): 安全地處理 sharpe_ratio 可能為 None 的情況 ***
         sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
         if sharpe_ratio is not None:
             self.logger.info(f"夏普比率: {sharpe_ratio:.2f}")
