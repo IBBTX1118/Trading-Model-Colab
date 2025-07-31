@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.0 (對應整合式機器學習優化架構 v3.0)
+# 版本: 3.1 (修正 Backtrader 策略中的特徵讀取錯誤)
 
 import logging
 import sys
@@ -63,22 +63,22 @@ class FinalMLStrategy(bt.Strategy):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         
-        class FeatureIndicator(bt.Indicator):
-            lines = tuple(self.p.features)
-            params = (('features_df', None),)
-            
-            def __init__(self):
-                for i, feature in enumerate(self.p.features):
-                    self.lines[i] = self.p.features_df[feature]
-
-        self.feature_inds = FeatureIndicator(features_df=self.data.df, features=self.p.features)
+        # *** FIX (v3.1): 使用 backtrader 的標準方式來訪問特徵 ***
+        # 特徵現在是數據源 (data feed) 的一部分，可以透過 self.data.lines 訪問
+        # 我們為每個特徵創建一個引用，方便在 next 方法中使用
+        self.feature_lines = []
+        for feature_name in self.p.features:
+            # getattr 會動態地獲取 self.data.lines 上的同名特徵
+            self.feature_lines.append(getattr(self.data.lines, feature_name))
 
     def next(self):
         feature_vector = []
         try:
-            for i in range(len(self.p.features)):
-                feature_vector.append(self.feature_inds.lines[i][0])
+            # 從每個特徵的 line 中獲取當前 K 棒的值
+            for line in self.feature_lines:
+                feature_vector.append(line[0])
         except IndexError:
+            # 數據還不夠長，無法形成完整的特徵向量
             return
 
         feature_vector = np.array(feature_vector).reshape(1, -1)
@@ -141,6 +141,12 @@ class MLOptimizerAndBacktester:
         future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
         df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
         
+        # 確保 selected_features 中的欄位存在
+        missing_features = [f for f in self.selected_features if f not in df.columns]
+        if missing_features:
+            self.logger.warning(f"數據中缺少以下特徵，將被忽略: {missing_features}")
+            self.selected_features = [f for f in self.selected_features if f in df.columns]
+
         df.dropna(inplace=True)
         return df
 
@@ -169,7 +175,7 @@ class MLOptimizerAndBacktester:
 
     def run(self):
         """執行完整的優化與回測流程。"""
-        self.logger.info("========= 整合式優化與回測流程開始 (v3.0) =========")
+        self.logger.info("========= 整合式優化與回測流程開始 (v3.1) =========")
 
         # 1. 數據分割
         df_in_sample = self.full_df[self.full_df.index < self.config.OUT_OF_SAMPLE_START_DATE]
@@ -213,6 +219,7 @@ class MLOptimizerAndBacktester:
 
     def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier):
         """執行單次回測並打印報告。"""
+        # *** FIX (v3.1): 動態地創建包含特徵的數據源類別 ***
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
             params = tuple([(f, -1) for f in self.selected_features])
@@ -241,7 +248,8 @@ class MLOptimizerAndBacktester:
         self.logger.info("="*50)
         self.logger.info(f"最終資產價值: {cerebro.broker.getvalue():,.2f}")
         self.logger.info(f"總淨利: {trades.pnl.net.total:,.2f}")
-        self.logger.info(f"夏普比率: {analysis.sharpe.get_analysis().get('sharperatio', 'N/A'):.2f}")
+        sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
+        self.logger.info(f"夏普比率: {'N/A' if sharpe_ratio is None else sharpe_ratio:.2f}")
         self.logger.info(f"最大回撤: {analysis.drawdown.get_analysis().max.drawdown:.2f}%")
         self.logger.info(f"總交易次數: {trades.total.total}")
         if trades.total.total > 0:
