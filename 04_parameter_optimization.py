@@ -1,18 +1,23 @@
-# 檔名: 04_parameter_optimization.py
-# 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 2.0 (最終可行性驗證：使用錢道安通道突破策略)
+# 檔名: 04_ml_model_optimization.py
+# 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
+# 版本: 3.0 (對應整合式機器學習優化架構 v3.0)
 
 import logging
 import sys
 import json
-import re
 from pathlib import Path
 from typing import List, Dict, Any
 
 import pandas as pd
+import numpy as np
 import backtrader as bt
-import optuna
+import lightgbm as lgb
 from finta import TA
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+import optuna
 
 # ==============================================================================
 # 1. 配置區塊
@@ -20,68 +25,86 @@ from finta import TA
 class Config:
     """儲存腳本所需的所有配置參數。"""
     # --- 輸入檔案 ---
-    INPUT_DATA_FILE = Path("Output_Data_Pipeline_v2/MarketData/EURUSD_sml/EURUSD_sml_D1.parquet")
+    INPUT_FEATURES_FILE = Path("Output_ML_Pipeline/selected_features.json")
+    INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_All_Features")
     
-    # --- 輸出檔案 ---
+    # --- 輸出設定 ---
     OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
-    OUTPUT_FILENAME = "optimal_parameters.json"
+    
+    # --- 數據分割 ---
+    TRAIN_VALIDATION_SPLIT_DATE = "2023-01-01" # 用於分割訓練集和驗證集
+    OUT_OF_SAMPLE_START_DATE = "2024-01-01"    # 樣本外測試的起始日期
+
+    # --- Labeling (與 03 保持一致) ---
+    LABEL_LOOK_FORWARD_PERIODS: int = 5
+    LABEL_RETURN_THRESHOLD: float = 0.005
 
     # --- Optuna 優化設定 ---
-    N_TRIALS = 150
-    OPTIMIZE_METRIC = 'sharpe'
-    SAMPLER = 'TPE' 
-    PRUNING = True
-
+    N_TRIALS = 100 # 優化嘗試次數
+    
     # --- 回測設定 ---
     INITIAL_CASH = 100000.0
     COMMISSION = 0.001
-    
-    # --- 參數搜索範圍 ---
-    PARAMETER_RANGES = {
-        'DONCHIAN_period': (10, 200), # 突破策略通常需要較長的週期
-    }
+    ENTRY_PROB_THRESHOLD = 0.55
 
     LOG_LEVEL = "INFO"
 
 # ==============================================================================
-# 2. Backtrader 策略 (用於 Optuna) - 已升級為錢道安通道策略
+# 2. Backtrader 最終策略
 # ==============================================================================
-class OptunaStrategy(bt.Strategy):
-    """
-    *** NEW (v2.0): 使用錢道安通道突破策略作為最後的可行性驗證基準 ***
-    """
+class FinalMLStrategy(bt.Strategy):
     params = (
-        ('donchian_period', 20),
+        ('model', None),
+        ('features', None),
+        ('entry_threshold', 0.55),
     )
 
     def __init__(self):
-        self.donchian = bt.indicators.DonchianChannels(
-            self.data, 
-            period=self.p.donchian_period
-        )
-        # 買入信號：當收盤價上穿通道上軌
-        self.buy_signal = bt.indicators.CrossOver(self.data.close, self.donchian.lines.dch)
-        # 賣出信號：當收盤價下穿通道下軌
-        self.sell_signal = bt.indicators.CrossDown(self.data.close, self.donchian.lines.dcl)
+        if not self.p.model or not self.p.features:
+            raise ValueError("模型和特徵列表必須提供！")
+        
+        class FeatureIndicator(bt.Indicator):
+            lines = tuple(self.p.features)
+            params = (('features_df', None),)
+            
+            def __init__(self):
+                for i, feature in enumerate(self.p.features):
+                    self.lines[i] = self.p.features_df[feature]
 
+        self.feature_inds = FeatureIndicator(features_df=self.data.df, features=self.p.features)
 
     def next(self):
-        if not self.position:  # 如果沒有持倉
-            if self.buy_signal[0] > 0:
+        feature_vector = []
+        try:
+            for i in range(len(self.p.features)):
+                feature_vector.append(self.feature_inds.lines[i][0])
+        except IndexError:
+            return
+
+        feature_vector = np.array(feature_vector).reshape(1, -1)
+        pred_prob = self.p.model.predict_proba(feature_vector)[0][1]
+
+        if not self.position:
+            if pred_prob > self.p.entry_threshold:
                 self.buy()
-        else:  # 如果有持倉
-            if self.sell_signal[0] > 0:
+        else:
+            if pred_prob < 0.5:
                 self.sell()
 
 # ==============================================================================
-# 3. 參數優化器類別
+# 3. 主流程控制器
 # ==============================================================================
-class ParameterOptimizer:
+class MLOptimizerAndBacktester:
     def __init__(self, config: Config):
         self.config = config
         self.logger = self._setup_logger()
-        self.df_data = self._load_data()
         self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        self.selected_features = self._load_json(self.config.INPUT_FEATURES_FILE)['selected_features']
+        self.full_df = self._load_and_prepare_data()
+        
+        self.X_train, self.y_train = None, None
+        self.X_val, self.y_val = None, None
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger(self.__class__.__name__)
@@ -94,95 +117,148 @@ class ParameterOptimizer:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         return logger
 
-    def _load_data(self) -> pd.DataFrame:
-        if not self.config.INPUT_DATA_FILE.exists():
-            self.logger.critical(f"數據檔案 {self.config.INPUT_DATA_FILE} 不存在！")
+    def _load_json(self, file_path: Path) -> Dict:
+        if not file_path.exists():
+            self.logger.critical(f"輸入檔案 {file_path} 不存在！請先執行 03_feature_selection.py。")
             sys.exit(1)
-        self.logger.info(f"正在從 {self.config.INPUT_DATA_FILE} 載入回測數據...")
-        df = pd.read_parquet(self.config.INPUT_DATA_FILE)
-        df.index = pd.to_datetime(df.index)
-        df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        self.logger.info(f"成功從 {file_path} 載入特徵列表。")
+        return data
+
+    def _load_and_prepare_data(self) -> pd.DataFrame:
+        """載入所有數據，合併，並創建 Label。"""
+        input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
+        if not input_files:
+            self.logger.critical(f"在 {self.config.INPUT_DATA_DIR} 中找不到任何數據檔案！")
+            sys.exit(1)
+        
+        all_dfs = [pd.read_parquet(f) for f in input_files]
+        df = pd.concat(all_dfs).sort_index()
+        self.logger.info(f"已合併 {len(input_files)} 個檔案，共 {len(df)} 筆數據。")
+
+        # 創建 Label
+        future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
+        df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
+        
+        df.dropna(inplace=True)
         return df
 
     def objective(self, trial: optuna.trial.Trial) -> float:
+        """Optuna 的目標函數，用於尋找最佳超參數。"""
+        # 定義 LightGBM 的超參數搜索空間
+        param = {
+            'objective': 'binary',
+            'metric': 'binary_logloss',
+            'verbosity': -1,
+            'boosting_type': 'gbdt',
+            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 300),
+            'max_depth': trial.suggest_int('max_depth', 3, 12),
+            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
+            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
+        }
+
+        model = lgb.LGBMClassifier(**param)
+        model.fit(self.X_train, self.y_train)
         
-        # *** NEW (v2.0): 優化目標變為錢道安通道的週期 ***
-        donchian_period = trial.suggest_int("DONCHIAN_period", *self.config.PARAMETER_RANGES['DONCHIAN_period'])
+        preds = model.predict(self.X_val)
+        accuracy = accuracy_score(self.y_val, preds)
+        return accuracy
 
-        # --- 執行回測 ---
-        cerebro = bt.Cerebro(stdstats=False)
+    def run(self):
+        """執行完整的優化與回測流程。"""
+        self.logger.info("========= 整合式優化與回測流程開始 (v3.0) =========")
+
+        # 1. 數據分割
+        df_in_sample = self.full_df[self.full_df.index < self.config.OUT_OF_SAMPLE_START_DATE]
+        df_out_of_sample = self.full_df[self.full_df.index >= self.config.OUT_OF_SAMPLE_START_DATE]
+
+        df_train = df_in_sample[df_in_sample.index < self.config.TRAIN_VALIDATION_SPLIT_DATE]
+        df_val = df_in_sample[df_in_sample.index >= self.config.TRAIN_VALIDATION_SPLIT_DATE]
+
+        self.X_train = df_train[self.selected_features]
+        self.y_train = df_train['target']
+        self.X_val = df_val[self.selected_features]
+        self.y_val = df_val['target']
         
-        cerebro.addstrategy(OptunaStrategy, 
-                            donchian_period=donchian_period)
-        
-        data_feed = bt.feeds.PandasData(dataname=self.df_data)
-        cerebro.adddata(data_feed)
-        cerebro.broker.setcash(self.config.INITIAL_CASH)
-        cerebro.broker.setcommission(commission=self.config.COMMISSION)
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
-        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
+        self.logger.info(f"數據分割完成: 訓練集({len(df_train)}), 驗證集({len(df_val)}), 樣本外測試集({len(df_out_of_sample)})")
 
-        try:
-            results = cerebro.run()
-            strat = results[0]
-        except Exception:
-            return -100.0
-
-        # --- 提取結果 ---
-        trades = strat.analyzers.trades.get_analysis()
-        if trades.total.total == 0:
-            return -100.0
-            
-        sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0.0)
-        
-        trial.report(sharpe, step=0)
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
-
-        return sharpe if sharpe is not None else -100.0
-
-    def run(self) -> None:
-        self.logger.info(f"========= 參數優化流程開始 (v2.0 - 錢道安通道突破策略) =========")
-        self.logger.info(f"優化演算法: {self.config.SAMPLER.upper()}")
-        
-        sampler = optuna.samplers.TPESampler()
-        pruner = optuna.pruners.MedianPruner() if self.config.PRUNING else optuna.pruners.NopPruner()
-
-        study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+        # 2. 執行 Optuna 超參數優化
+        self.logger.info("--- 開始執行 LightGBM 超參數優化 ---")
+        study = optuna.create_study(direction='maximize')
         study.optimize(self.objective, n_trials=self.config.N_TRIALS, show_progress_bar=True)
-
-        self.logger.info("優化完成！")
-        if not study.best_trial or study.best_value <= 0:
-            self.logger.warning("警告：所有簡單策略原型（趨勢、回歸、突破）均未能找到正回報參數。")
-            self.logger.warning("這強烈建議應轉向更複雜的模型（如機器學習）來尋找市場規律。")
-            self.logger.info(f"*** 驗證閘門判定：可行（基於簡單策略無效的結論）。批准進入第四階段！ ***")
-        else:
-            self.logger.info(f"*** 成功！找到可行參數組合，夏普比率為正。批准進入下一階段！ ***")
-
-        # 無論結果如何，都儲存找到的最佳（或最不差）的參數
-        self.logger.info(f"最佳 Trial: {study.best_trial.number}")
-        self.logger.info(f"最佳分數 ({self.config.OPTIMIZE_METRIC}): {study.best_value:.4f}")
-        self.logger.info("最佳參數:")
+        
+        self.logger.info("超參數優化完成！")
+        self.logger.info(f"最佳驗證集準確率: {study.best_value:.4f}")
+        self.logger.info("最佳超參數:")
         for key, value in study.best_params.items():
             self.logger.info(f"  - {key}: {value}")
 
-        output_path = self.config.OUTPUT_BASE_DIR / self.config.OUTPUT_FILENAME
-        output_data = {
-            "description": f"由 04_parameter_optimization.py (v2.0) 產生的最佳參數 (驗證策略: 錢道安通道突破)",
-            "best_value": study.best_value,
-            "optimal_parameters": study.best_params
-        }
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=4)
-        self.logger.info(f"最佳參數已儲存到: {output_path}")
+        # 3. 訓練最終模型
+        self.logger.info("--- 使用最佳超參數訓練最終模型 ---")
+        X_in_sample = df_in_sample[self.selected_features]
+        y_in_sample = df_in_sample['target']
+        
+        final_model = lgb.LGBMClassifier(**study.best_params)
+        final_model.fit(X_in_sample, y_in_sample)
+        self.logger.info("最終模型訓練完成。")
 
-        self.logger.info("========= 參數優化流程結束 =========")
+        # 4. 執行樣本外最終回測
+        self.logger.info("--- 開始執行樣本外最終回測 ---")
+        self.run_final_backtest(df_out_of_sample, final_model)
+
+        self.logger.info("========= 流程結束 =========")
+
+    def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier):
+        """執行單次回測並打印報告。"""
+        class PandasDataWithFeatures(bt.feeds.PandasData):
+            lines = tuple(self.selected_features)
+            params = tuple([(f, -1) for f in self.selected_features])
+
+        data_feed = PandasDataWithFeatures(dataname=df)
+        cerebro = bt.Cerebro()
+        cerebro.adddata(data_feed)
+        cerebro.addstrategy(FinalMLStrategy, model=model, features=self.selected_features,
+                            entry_threshold=self.config.ENTRY_PROB_THRESHOLD)
+        
+        cerebro.broker.setcash(self.config.INITIAL_CASH)
+        cerebro.broker.setcommission(commission=self.config.COMMISSION)
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
+        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
+
+        results = cerebro.run()
+        
+        # 打印報告
+        strat = results[0]
+        analysis = strat.analyzers
+        trades = analysis.trades.get_analysis()
+        
+        self.logger.info("\n" + "="*50)
+        self.logger.info("樣本外最終回測績效報告")
+        self.logger.info("="*50)
+        self.logger.info(f"最終資產價值: {cerebro.broker.getvalue():,.2f}")
+        self.logger.info(f"總淨利: {trades.pnl.net.total:,.2f}")
+        self.logger.info(f"夏普比率: {analysis.sharpe.get_analysis().get('sharperatio', 'N/A'):.2f}")
+        self.logger.info(f"最大回撤: {analysis.drawdown.get_analysis().max.drawdown:.2f}%")
+        self.logger.info(f"總交易次數: {trades.total.total}")
+        if trades.total.total > 0:
+            self.logger.info(f"勝率: {trades.won.total / trades.total.total:.2%}")
+        self.logger.info("="*50)
+
+        # 繪製圖表
+        plot_path = self.config.OUTPUT_BASE_DIR / "final_backtest_chart.png"
+        fig = cerebro.plot(style='candlestick', iplot=False)[0][0]
+        fig.savefig(plot_path, dpi=300)
+        self.logger.info(f"最終回測圖表已儲存至: {plot_path}")
 
 if __name__ == "__main__":
     try:
         config = Config()
-        optimizer = ParameterOptimizer(config)
+        optimizer = MLOptimizerAndBacktester(config)
         optimizer.run()
     except Exception as e:
-        logging.critical(f"參數優化腳本執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
+        logging.critical(f"腳本執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
         sys.exit(1)
