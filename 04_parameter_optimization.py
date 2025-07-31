@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.1 (修正 Backtrader 策略中的特徵讀取錯誤)
+# 版本: 3.2 (修正最終報告的格式化錯誤並消除 UserWarning)
 
 import logging
 import sys
@@ -63,12 +63,9 @@ class FinalMLStrategy(bt.Strategy):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         
-        # *** FIX (v3.1): 使用 backtrader 的標準方式來訪問特徵 ***
-        # 特徵現在是數據源 (data feed) 的一部分，可以透過 self.data.lines 訪問
-        # 我們為每個特徵創建一個引用，方便在 next 方法中使用
+        # 為每個特徵創建一個引用，方便在 next 方法中使用
         self.feature_lines = []
         for feature_name in self.p.features:
-            # getattr 會動態地獲取 self.data.lines 上的同名特徵
             self.feature_lines.append(getattr(self.data.lines, feature_name))
 
     def next(self):
@@ -152,7 +149,6 @@ class MLOptimizerAndBacktester:
 
     def objective(self, trial: optuna.trial.Trial) -> float:
         """Optuna 的目標函數，用於尋找最佳超參數。"""
-        # 定義 LightGBM 的超參數搜索空間
         param = {
             'objective': 'binary',
             'metric': 'binary_logloss',
@@ -167,15 +163,16 @@ class MLOptimizerAndBacktester:
         }
 
         model = lgb.LGBMClassifier(**param)
-        model.fit(self.X_train, self.y_train)
+        # *** FIX (v3.2): 使用 .values 將 DataFrame 轉為 NumPy array 以消除警告 ***
+        model.fit(self.X_train.values, self.y_train.values)
         
-        preds = model.predict(self.X_val)
-        accuracy = accuracy_score(self.y_val, preds)
+        preds = model.predict(self.X_val.values)
+        accuracy = accuracy_score(self.y_val.values, preds)
         return accuracy
 
     def run(self):
         """執行完整的優化與回測流程。"""
-        self.logger.info("========= 整合式優化與回測流程開始 (v3.1) =========")
+        self.logger.info("========= 整合式優化與回測流程開始 (v3.2) =========")
 
         # 1. 數據分割
         df_in_sample = self.full_df[self.full_df.index < self.config.OUT_OF_SAMPLE_START_DATE]
@@ -208,7 +205,7 @@ class MLOptimizerAndBacktester:
         y_in_sample = df_in_sample['target']
         
         final_model = lgb.LGBMClassifier(**study.best_params)
-        final_model.fit(X_in_sample, y_in_sample)
+        final_model.fit(X_in_sample.values, y_in_sample.values)
         self.logger.info("最終模型訓練完成。")
 
         # 4. 執行樣本外最終回測
@@ -219,7 +216,6 @@ class MLOptimizerAndBacktester:
 
     def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier):
         """執行單次回測並打印報告。"""
-        # *** FIX (v3.1): 動態地創建包含特徵的數據源類別 ***
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
             params = tuple([(f, -1) for f in self.selected_features])
@@ -248,8 +244,14 @@ class MLOptimizerAndBacktester:
         self.logger.info("="*50)
         self.logger.info(f"最終資產價值: {cerebro.broker.getvalue():,.2f}")
         self.logger.info(f"總淨利: {trades.pnl.net.total:,.2f}")
+        
+        # *** FIX (v3.2): 安全地處理 sharpe_ratio 可能為 None 的情況 ***
         sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
-        self.logger.info(f"夏普比率: {'N/A' if sharpe_ratio is None else sharpe_ratio:.2f}")
+        if sharpe_ratio is not None:
+            self.logger.info(f"夏普比率: {sharpe_ratio:.2f}")
+        else:
+            self.logger.info("夏普比率: N/A (無交易或無波動)")
+            
         self.logger.info(f"最大回撤: {analysis.drawdown.get_analysis().max.drawdown:.2f}%")
         self.logger.info(f"總交易次數: {trades.total.total}")
         if trades.total.total > 0:
