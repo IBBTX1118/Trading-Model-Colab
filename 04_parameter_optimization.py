@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 1.6 (修正指標實例化時機錯誤 (AttributeError: 'NoneType'))
+# 版本: 1.6 (對應迭代式開發架構 v2.0，修正指標實例化錯誤)
 
 import logging
 import sys
@@ -81,8 +81,9 @@ class MFIIndicator(bt.Indicator):
 # ==============================================================================
 class OptunaStrategy(bt.Strategy):
     """
-    *** NEW (v1.6): 修正指標實例化方式 ***
-    這個策略現在接收指標的「類別」和「參數」，並在內部安全地建立實例。
+    這個策略接收指標的「類別」和「參數」，並在內部安全地建立實例。
+    它使用兩條同類型但不同週期的指標（一快一慢），
+    在它們交叉時進行買賣，這是一個穩健的參數評估基準。
     """
     params = (
         ('indicator_class', None),
@@ -94,9 +95,9 @@ class OptunaStrategy(bt.Strategy):
         if not self.p.indicator_class or not self.p.fast_params or not self.p.slow_params:
             raise ValueError("必須提供指標類別和快、慢線參數！")
         
-        # *** FIX: 在策略內部安全地實例化指標 ***
-        fast_indicator = self.p.indicator_class(**self.p.fast_params)
-        slow_indicator = self.p.indicator_class(**self.p.slow_params)
+        # 在策略內部安全地實例化指標
+        fast_indicator = self.p.indicator_class(self.data, **self.p.fast_params)
+        slow_indicator = self.p.indicator_class(self.data, **self.p.slow_params)
         
         self.crossover = bt.indicators.CrossOver(fast_indicator, slow_indicator)
 
@@ -157,6 +158,7 @@ class ParameterOptimizer:
             ind_type_match = re.match(r"([A-Z]+)", feature)
             if ind_type_match:
                 ind_type = ind_type_match.group(1)
+                # 只選擇適合做雙線交叉的指標
                 if ind_type in ['SMA', 'EMA']:
                     unique_indicator_types.add(ind_type)
 
@@ -193,7 +195,6 @@ class ParameterOptimizer:
         # --- 執行回測 ---
         cerebro = bt.Cerebro(stdstats=False)
         
-        # *** FIX: 將指標類別和參數字典傳遞給策略 ***
         fast_params = {'period': p_fast_val}
         slow_params = {'period': p_slow_val}
         
@@ -228,7 +229,7 @@ class ParameterOptimizer:
             self.logger.error("沒有解析出任何適合進行交叉策略優化的指標 (如 SMA, EMA)。")
             return
 
-        self.logger.info(f"========= 參數優化流程開始 (v1.6) =========")
+        self.logger.info(f"========= 參數優化流程開始 (v1.6 - 雙均線交叉) =========")
         self.logger.info(f"優化目標: {self.config.OPTIMIZE_METRIC.upper()}")
 
         study = optuna.create_study(direction="maximize")
