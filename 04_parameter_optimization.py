@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.5 (移除繪圖功能，只輸出績效報告)
+# 版本: 3.5 (徹底移除繪圖功能，只輸出績效報告)
 
 import logging
 import sys
@@ -207,7 +207,10 @@ class MLOptimizerAndBacktester:
 
         # 4. 執行樣本外最終回測
         self.logger.info("--- 開始執行樣本外最終回測 ---")
-        self.run_final_backtest(df_out_of_sample, final_model)
+        if df_out_of_sample.empty:
+            self.logger.warning("樣本外數據為空，無法執行最終回測。")
+        else:
+            self.run_final_backtest(df_out_of_sample, final_model)
 
         self.logger.info("========= 流程結束 =========")
 
@@ -254,11 +257,14 @@ class MLOptimizerAndBacktester:
             self.logger.info(f"勝率: {trades.won.total / trades.total.total:.2%}")
         self.logger.info("="*50)
 
-        # *** 繪圖功能已移除 ***
+        # *** 繪圖功能已移除 (v3.5) ***
         # plot_path = self.config.OUTPUT_BASE_DIR / "final_backtest_chart.png"
-        # fig = cerebro.plot(style='candlestick', iplot=False)[0][0]
-        # fig.savefig(plot_path, dpi=300)
-        # self.logger.info(f"最終回測圖表已儲存至: {plot_path}")
+        # try:
+        #     fig = cerebro.plot(style='candlestick', iplot=False)[0][0]
+        #     fig.savefig(plot_path, dpi=300)
+        #     self.logger.info(f"最終回測圖表已儲存至: {plot_path}")
+        # except Exception as e:
+        #     self.logger.warning(f"繪製圖表時發生錯誤，已跳過: {e}")
 
 if __name__ == "__main__":
     try:
