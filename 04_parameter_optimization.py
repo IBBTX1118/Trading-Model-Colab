@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 1.8 (升級為可配置的優化引擎，支持不同超參數調校演算法)
+# 版本: 1.9 (策略迭代：使用布林帶 + RSI 確認策略進行可行性驗證)
 
 import logging
 import sys
@@ -27,16 +27,9 @@ class Config:
     OUTPUT_FILENAME = "optimal_parameters.json"
 
     # --- Optuna 優化設定 ---
-    N_TRIALS = 150
+    N_TRIALS = 200 # 增加嘗試次數，因為參數維度增加
     OPTIMIZE_METRIC = 'sharpe'
-    
-    # *** NEW (v1.8): 選擇您的超參數調校演算法 ***
-    # 'TPE': 貝葉斯優化 (預設，高效)
-    # 'Grid': 網格搜索 (窮舉，最慢)
-    # 'Random': 隨機搜索
     SAMPLER = 'TPE' 
-    
-    # 是否啟用剪枝 (Pruning): 自動提早結束沒有潛力的試驗，以節省時間
     PRUNING = True
 
     # --- 回測設定 ---
@@ -44,30 +37,29 @@ class Config:
     COMMISSION = 0.001
     
     # --- 參數搜索範圍 ---
-    # 對於 'Grid' 搜索，列表中的每個值都會被測試
-    # 對於 'TPE' 和 'Random' 搜索，會在元組 (min, max) 範圍內尋找
     PARAMETER_RANGES = {
-        'BBANDS_period': [10, 20, 30, 40, 50, 60], # Grid Search 的範例
-        'BBANDS_devfactor': [1.8, 2.0, 2.2, 2.5, 3.0], # Grid Search 的範例
-    }
-    # TPE/Random 的搜索範圍
-    PARAMETER_RANGES_TPE = {
         'BBANDS_period': (10, 100),
         'BBANDS_devfactor': (1.5, 4.0),
+        'RSI_period': (5, 50),
+        'RSI_upper': (65, 85), # RSI 超買區
+        'RSI_lower': (15, 35), # RSI 超賣區
     }
 
     LOG_LEVEL = "INFO"
 
 # ==============================================================================
-# 2. Backtrader 策略 (用於 Optuna) - 布林帶策略
+# 2. Backtrader 策略 (用於 Optuna) - 已升級為布林帶 + RSI 策略
 # ==============================================================================
 class OptunaStrategy(bt.Strategy):
     """
-    使用布林帶反轉策略作為可行性驗證基準
+    *** NEW (v1.9): 使用布林帶 + RSI 確認策略作為新的可行性驗證基準 ***
     """
     params = (
         ('bb_period', 20),
         ('bb_devfactor', 2.0),
+        ('rsi_period', 14),
+        ('rsi_upper', 70),
+        ('rsi_lower', 30),
     )
 
     def __init__(self):
@@ -76,13 +68,19 @@ class OptunaStrategy(bt.Strategy):
             period=self.p.bb_period, 
             devfactor=self.p.bb_devfactor
         )
+        self.rsi = bt.indicators.RSI(
+            self.data.close,
+            period=self.p.rsi_period
+        )
 
     def next(self):
-        if not self.position:
-            if self.data.close[0] <= self.bbands.lines.bot[0]:
+        if not self.position:  # 如果沒有持倉
+            # 當價格觸及下軌且 RSI 超賣時，買入
+            if self.data.close[0] <= self.bbands.lines.bot[0] and self.rsi[0] < self.p.rsi_lower:
                 self.buy()
-        else:
-            if self.data.close[0] >= self.bbands.lines.top[0]:
+        else:  # 如果有持倉
+            # 當價格觸及上軌且 RSI 超買時，賣出
+            if self.data.close[0] >= self.bbands.lines.top[0] and self.rsi[0] > self.p.rsi_upper:
                 self.sell()
 
 # ==============================================================================
@@ -118,20 +116,23 @@ class ParameterOptimizer:
 
     def objective(self, trial: optuna.trial.Trial) -> float:
         
-        if self.config.SAMPLER == 'Grid':
-            # Grid Search 從預定義的列表中選擇
-            bb_period = trial.suggest_categorical("BBANDS_period", self.config.PARAMETER_RANGES['BBANDS_period'])
-            bb_devfactor = trial.suggest_categorical("BBANDS_devfactor", self.config.PARAMETER_RANGES['BBANDS_devfactor'])
-        else:
-            # TPE/Random 從範圍中選擇
-            p_period_min, p_period_max = self.config.PARAMETER_RANGES_TPE['BBANDS_period']
-            p_dev_min, p_dev_max = self.config.PARAMETER_RANGES_TPE['BBANDS_devfactor']
-            bb_period = trial.suggest_int("BBANDS_period", p_period_min, p_period_max)
-            bb_devfactor = trial.suggest_float("BBANDS_devfactor", p_dev_min, p_dev_max, step=0.1)
+        # *** NEW (v1.9): 優化目標變為 BBands 和 RSI 的多個參數 ***
+        bb_period = trial.suggest_int("BBANDS_period", *self.config.PARAMETER_RANGES['BBANDS_period'])
+        bb_devfactor = trial.suggest_float("BBANDS_devfactor", *self.config.PARAMETER_RANGES['BBANDS_devfactor'], step=0.1)
+        rsi_period = trial.suggest_int("RSI_period", *self.config.PARAMETER_RANGES['RSI_period'])
+        rsi_upper = trial.suggest_int("RSI_upper", *self.config.PARAMETER_RANGES['RSI_upper'])
+        rsi_lower = trial.suggest_int("RSI_lower", *self.config.PARAMETER_RANGES['RSI_lower'])
 
         # --- 執行回測 ---
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.addstrategy(OptunaStrategy, bb_period=bb_period, bb_devfactor=bb_devfactor)
+        
+        cerebro.addstrategy(OptunaStrategy, 
+                            bb_period=bb_period,
+                            bb_devfactor=bb_devfactor,
+                            rsi_period=rsi_period,
+                            rsi_upper=rsi_upper,
+                            rsi_lower=rsi_lower)
+        
         data_feed = bt.feeds.PandasData(dataname=self.df_data)
         cerebro.adddata(data_feed)
         cerebro.broker.setcash(self.config.INITIAL_CASH)
@@ -152,7 +153,6 @@ class ParameterOptimizer:
             
         sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0.0)
         
-        # 向 Pruner 報告結果
         trial.report(sharpe, step=0)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
@@ -160,26 +160,10 @@ class ParameterOptimizer:
         return sharpe if sharpe is not None else -100.0
 
     def run(self) -> None:
-        self.logger.info(f"========= 參數優化流程開始 (v1.8 - 優化引擎) =========")
+        self.logger.info(f"========= 參數優化流程開始 (v1.9 - 布林帶+RSI策略) =========")
         self.logger.info(f"優化演算法: {self.config.SAMPLER.upper()}")
         
-        # *** NEW (v1.8): 根據設定選擇 Sampler ***
-        sampler = None
-        if self.config.SAMPLER.lower() == 'grid':
-            search_space = {
-                "BBANDS_period": self.config.PARAMETER_RANGES['BBANDS_period'],
-                "BBANDS_devfactor": self.config.PARAMETER_RANGES['BBANDS_devfactor']
-            }
-            sampler = optuna.samplers.GridSampler(search_space)
-            # Grid Search 會測試所有組合，N_TRIALS 應設為組合總數
-            self.config.N_TRIALS = len(search_space['BBANDS_period']) * len(search_space['BBANDS_devfactor'])
-            self.logger.info(f"網格搜索已啟用，將執行全部 {self.config.N_TRIALS} 種組合。")
-        elif self.config.SAMPLER.lower() == 'random':
-            sampler = optuna.samplers.RandomSampler()
-        else: # 預設為 TPE (貝葉斯優化)
-            sampler = optuna.samplers.TPESampler()
-
-        # 設定 Pruner
+        sampler = optuna.samplers.TPESampler()
         pruner = optuna.pruners.MedianPruner() if self.config.PRUNING else optuna.pruners.NopPruner()
 
         study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
@@ -200,7 +184,7 @@ class ParameterOptimizer:
             # 儲存最佳參數
             output_path = self.config.OUTPUT_BASE_DIR / self.config.OUTPUT_FILENAME
             output_data = {
-                "description": f"由 04_parameter_optimization.py (v1.8) 產生的最佳參數 (驗證策略: 布林帶反轉)",
+                "description": f"由 04_parameter_optimization.py (v1.9) 產生的最佳參數 (驗證策略: 布林帶+RSI)",
                 "best_value": study.best_value,
                 "optimal_parameters": study.best_params
             }
