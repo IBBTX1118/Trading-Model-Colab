@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.3 (修正因數據中存在 inf 值導致的繪圖錯誤)
+# 版本: 3.5 (移除繪圖功能，只輸出績效報告)
 
 import logging
 import sys
@@ -13,7 +13,7 @@ import numpy as np
 import backtrader as bt
 import lightgbm as lgb
 from finta import TA
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt # 繪圖功能已移除
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
@@ -139,7 +139,6 @@ class MLOptimizerAndBacktester:
             self.logger.warning(f"數據中缺少以下特徵，將被忽略: {missing_features}")
             self.selected_features = [f for f in self.selected_features if f in df.columns]
 
-        # *** NEW (v3.3): 清理無窮大值，以防止繪圖錯誤 ***
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.logger.info("已將數據中的無窮大值替換為 NaN。")
 
@@ -170,7 +169,7 @@ class MLOptimizerAndBacktester:
 
     def run(self):
         """執行完整的優化與回測流程。"""
-        self.logger.info("========= 整合式優化與回測流程開始 (v3.3) =========")
+        self.logger.info("========= 整合式優化與回測流程開始 (v3.5) =========")
 
         # 1. 數據分割
         df_in_sample = self.full_df[self.full_df.index < self.config.OUT_OF_SAMPLE_START_DATE]
@@ -216,7 +215,7 @@ class MLOptimizerAndBacktester:
         """執行單次回測並打印報告。"""
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
-            params = tuple([(f, -1) for f in self.selected_features])
+            params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
 
         data_feed = PandasDataWithFeatures(dataname=df)
         cerebro = bt.Cerebro()
@@ -255,11 +254,11 @@ class MLOptimizerAndBacktester:
             self.logger.info(f"勝率: {trades.won.total / trades.total.total:.2%}")
         self.logger.info("="*50)
 
-        # 繪製圖表
-        plot_path = self.config.OUTPUT_BASE_DIR / "final_backtest_chart.png"
-        fig = cerebro.plot(style='candlestick', iplot=False)[0][0]
-        fig.savefig(plot_path, dpi=300)
-        self.logger.info(f"最終回測圖表已儲存至: {plot_path}")
+        # *** 繪圖功能已移除 ***
+        # plot_path = self.config.OUTPUT_BASE_DIR / "final_backtest_chart.png"
+        # fig = cerebro.plot(style='candlestick', iplot=False)[0][0]
+        # fig.savefig(plot_path, dpi=300)
+        # self.logger.info(f"最終回測圖表已儲存至: {plot_path}")
 
 if __name__ == "__main__":
     try:
