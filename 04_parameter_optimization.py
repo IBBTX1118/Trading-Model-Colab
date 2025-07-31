@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 使用 Optuna 和 Backtrader 為篩選出的特徵尋找最佳參數。
-# 版本: 1.5 (策略升級為雙均線交叉，以獲得更有效的參數評估)
+# 版本: 1.6 (修正指標實例化時機錯誤 (AttributeError: 'NoneType'))
 
 import logging
 import sys
@@ -81,20 +81,24 @@ class MFIIndicator(bt.Indicator):
 # ==============================================================================
 class OptunaStrategy(bt.Strategy):
     """
-    *** NEW (v1.5): 升級為雙指標交叉策略 ***
-    這個策略使用兩條同類型但不同週期的指標（一快一慢），
-    在它們交叉時進行買賣，這是一個更穩健的參數評估基準。
+    *** NEW (v1.6): 修正指標實例化方式 ***
+    這個策略現在接收指標的「類別」和「參數」，並在內部安全地建立實例。
     """
     params = (
-        ('fast_indicator', None),
-        ('slow_indicator', None),
+        ('indicator_class', None),
+        ('fast_params', None),
+        ('slow_params', None),
     )
 
     def __init__(self):
-        if not self.p.fast_indicator or not self.p.slow_indicator:
-            raise ValueError("必須提供快速和慢速指標！")
+        if not self.p.indicator_class or not self.p.fast_params or not self.p.slow_params:
+            raise ValueError("必須提供指標類別和快、慢線參數！")
         
-        self.crossover = bt.indicators.CrossOver(self.p.fast_indicator, self.p.slow_indicator)
+        # *** FIX: 在策略內部安全地實例化指標 ***
+        fast_indicator = self.p.indicator_class(**self.p.fast_params)
+        slow_indicator = self.p.indicator_class(**self.p.slow_params)
+        
+        self.crossover = bt.indicators.CrossOver(fast_indicator, slow_indicator)
 
     def next(self):
         if self.crossover > 0:  # 快線上穿慢線
@@ -150,11 +154,10 @@ class ParameterOptimizer:
         blueprints = {}
         unique_indicator_types = set()
         for feature in self.selected_features:
-            # *** NEW (v1.5): 只選擇適合做交叉策略的指標類型 ***
             ind_type_match = re.match(r"([A-Z]+)", feature)
             if ind_type_match:
                 ind_type = ind_type_match.group(1)
-                if ind_type in ['SMA', 'EMA']: # 暫時只專注於最經典的均線交叉
+                if ind_type in ['SMA', 'EMA']:
                     unique_indicator_types.add(ind_type)
 
         self.logger.info("已解析出以下適合進行交叉策略優化的指標類型:")
@@ -174,30 +177,30 @@ class ParameterOptimizer:
 
     def objective(self, trial: optuna.trial.Trial) -> float:
         if not self.indicator_blueprints:
-             return -200.0 # 如果沒有可優化的指標，直接返回
+             return -200.0
 
         ind_type_to_optimize = trial.suggest_categorical("indicator_type", list(self.indicator_blueprints.keys()))
         ind_class = self.indicator_blueprints[ind_type_to_optimize]
         
-        # *** NEW (v1.5): 為快線和慢線建議參數 ***
         p_range_min, p_range_max = self.config.PARAMETER_RANGES[ind_type_to_optimize]
         
-        # 建議快線週期
         p_fast_name = f"{ind_type_to_optimize}_fast_period"
         p_fast_val = trial.suggest_int(p_fast_name, p_range_min, p_range_max - 1)
         
-        # 建議慢線週期，確保它比快線長
         p_slow_name = f"{ind_type_to_optimize}_slow_period"
         p_slow_val = trial.suggest_int(p_slow_name, p_fast_val + 1, p_range_max)
 
         # --- 執行回測 ---
         cerebro = bt.Cerebro(stdstats=False)
         
-        # 傳入實例化的指標，而不是類別
-        fast_indicator = ind_class(period=p_fast_val)
-        slow_indicator = ind_class(period=p_slow_val)
+        # *** FIX: 將指標類別和參數字典傳遞給策略 ***
+        fast_params = {'period': p_fast_val}
+        slow_params = {'period': p_slow_val}
         
-        cerebro.addstrategy(OptunaStrategy, fast_indicator=fast_indicator, slow_indicator=slow_indicator)
+        cerebro.addstrategy(OptunaStrategy, 
+                            indicator_class=ind_class,
+                            fast_params=fast_params, 
+                            slow_params=slow_params)
         
         data_feed = bt.feeds.PandasData(dataname=self.df_data)
         cerebro.adddata(data_feed)
@@ -225,7 +228,7 @@ class ParameterOptimizer:
             self.logger.error("沒有解析出任何適合進行交叉策略優化的指標 (如 SMA, EMA)。")
             return
 
-        self.logger.info(f"========= 參數優化流程開始 (v1.5 - 雙均線交叉) =========")
+        self.logger.info(f"========= 參數優化流程開始 (v1.6) =========")
         self.logger.info(f"優化目標: {self.config.OPTIMIZE_METRIC.upper()}")
 
         study = optuna.create_study(direction="maximize")
@@ -248,7 +251,7 @@ class ParameterOptimizer:
         # 儲存最佳參數
         output_path = self.config.OUTPUT_BASE_DIR / self.config.OUTPUT_FILENAME
         output_data = {
-            "description": f"由 04_parameter_optimization.py (v1.5) 產生的最佳參數 (優化目標: {self.config.OPTIMIZE_METRIC})",
+            "description": f"由 04_parameter_optimization.py (v1.6) 產生的最佳參數 (優化目標: {self.config.OPTIMIZE_METRIC})",
             "best_value": study.best_value,
             "optimal_parameters": study.best_params
         }
