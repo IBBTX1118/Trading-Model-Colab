@@ -266,9 +266,11 @@ class MLOptimizerAndBacktester:
 
     # ★★★【調整 5】: 全新的主執行函式 run ★★★
     # 舊的 run 函式被替換為一個主迴圈，調用上述的單一市場處理函式
+
     def run(self):
         """執行完整的主流程：遍歷所有找到的市場數據檔案並逐一處理。"""
-        self.logger.info(f"========= 整合式優化與回測流程開始 (版本 {__doc__.split('版本: ')[1].split(' ')[0]}) =========")
+        # --- ↓↓↓ 修改成這樣即可 ↓↓↓ ---
+        self.logger.info(f"========= 整合式優化與回測流程開始 (版本 3.6 - Per-Market) =========")
 
         input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
         if not input_files:
