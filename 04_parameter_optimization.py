@@ -31,7 +31,7 @@ class Config:
     N_TRIALS = 100
     INITIAL_CASH = 100000.0
     COMMISSION = 0.001
-    ENTRY_PROB_THRESHOLD = 0.55
+    ENTRY_PROB_THRESHOLD = 0.50
 
 # ==============================================================================
 # 2. Backtrader 最終策略
