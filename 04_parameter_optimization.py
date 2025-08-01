@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.8 (輸出修正版：使用 print 確保在 Colab 中顯示報告)
+# 版本: 3.9 (ROC AUC 優化版)
 
 import logging
 import sys
@@ -13,7 +13,8 @@ import numpy as np
 import backtrader as bt
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+# 導入 roc_auc_score
+from sklearn.metrics import accuracy_score, roc_auc_score
 
 import optuna
 
@@ -31,13 +32,14 @@ class Config:
     N_TRIALS = 100
     INITIAL_CASH = 100000.0
     COMMISSION = 0.001
+    # 維持您指定的進場門檻
     ENTRY_PROB_THRESHOLD = 0.50
 
 # ==============================================================================
 # 2. Backtrader 最終策略
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
-    params = (('model', None), ('features', None), ('entry_threshold', 0.55))
+    params = (('model', None), ('features', None), ('entry_threshold', 0.50))
 
     def __init__(self):
         if not self.p.model or not self.p.features:
@@ -64,7 +66,6 @@ class MLOptimizerAndBacktester:
         self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
         self.selected_features = self._load_json(self.config.INPUT_FEATURES_FILE)['selected_features']
         self.all_backtest_results = {}
-        # 移除 logger 設定，因為我們將改用 print
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path) -> Dict:
@@ -77,6 +78,7 @@ class MLOptimizerAndBacktester:
         return data
 
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, X_val, y_val) -> float:
+        """Optuna 的目標函數，現在優化 ROC AUC 分數。"""
         param = {
             'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
             'boosting_type': 'gbdt', 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
@@ -89,7 +91,10 @@ class MLOptimizerAndBacktester:
         }
         model = lgb.LGBMClassifier(**param)
         model.fit(X_train.values, y_train.values)
-        return accuracy_score(y_val.values, model.predict(X_val.values))
+        
+        # 改用 roc_auc_score 進行評估
+        pred_probs = model.predict_proba(X_val.values)[:, 1] # 獲取預測為 "上漲" 的機率
+        return roc_auc_score(y_val.values, pred_probs)
 
     def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier, market_name: str):
         class PandasDataWithFeatures(bt.feeds.PandasData):
@@ -165,10 +170,10 @@ class MLOptimizerAndBacktester:
         X_val, y_val = df_val[current_features], df_val['target']
         print(f"資訊: 數據分割完成: 訓練({len(X_train)}), 驗證({len(X_val)}), 樣本外({len(df_out_of_sample)})")
 
-        print("資訊: --- 開始執行 LightGBM 超參數優化 ---")
+        print("資訊: --- 開始執行 LightGBM 超參數優化 (目標: ROC AUC) ---")
         study = optuna.create_study(direction='maximize')
         study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), n_trials=self.config.N_TRIALS, show_progress_bar=True)
-        print(f"資訊: 超參數優化完成！最佳驗證集準確率: {study.best_value:.4f}")
+        print(f"資訊: 超參數優化完成！最佳 ROC AUC 分數: {study.best_value:.4f}")
 
         print("資訊: --- 使用最佳超參數訓練最終模型 ---")
         X_in_sample, y_in_sample = df_in_sample[current_features], df_in_sample['target']
@@ -178,7 +183,7 @@ class MLOptimizerAndBacktester:
         self.run_final_backtest(df_out_of_sample, final_model, market_name)
 
     def run(self):
-        print(f"========= 整合式優化與回測流程開始 (版本 3.8 - Print 輸出) =========")
+        print(f"========= 整合式優化與回測流程開始 (版本 3.9 - ROC AUC 優化) =========")
         input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
         if not input_files:
             print(f"致命錯誤: 在 {self.config.INPUT_DATA_DIR} 中找不到任何數據檔案！流程中止。")
