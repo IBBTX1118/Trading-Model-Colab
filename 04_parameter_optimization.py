@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.6 (修正版：採用單一市場優化與回測邏輯，杜絕數據洩漏)
+# 版本: 3.7 (整合版：單一市場優化與穩健性修正)
 
 import logging
 import sys
@@ -18,7 +18,7 @@ from sklearn.metrics import accuracy_score
 import optuna
 
 # ==============================================================================
-# 1. 配置區塊 (維持不變)
+# 1. 配置區塊
 # ==============================================================================
 class Config:
     """儲存腳本所需的所有配置參數。"""
@@ -48,7 +48,7 @@ class Config:
     LOG_LEVEL = "INFO"
 
 # ==============================================================================
-# 2. Backtrader 最終策略 (維持不變)
+# 2. Backtrader 最終策略
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
@@ -84,19 +84,15 @@ class FinalMLStrategy(bt.Strategy):
                 self.sell()
 
 # ==============================================================================
-# 3. 主流程控制器 (核心調整部分)
+# 3. 主流程控制器
 # ==============================================================================
 class MLOptimizerAndBacktester:
-    # ★★★【調整 1】: __init__ 初始化調整 ★★★
     def __init__(self, config: Config):
         self.config = config
         self.logger = self._setup_logger()
         self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
         
-        # 不再載入和合併所有數據，而是在迴圈外預先載入全域特徵列表
         self.selected_features = self._load_json(self.config.INPUT_FEATURES_FILE)['selected_features']
-        
-        # 初始化一個字典來儲存所有市場的最終回測結果，方便比較
         self.all_backtest_results = {}
 
     def _setup_logger(self) -> logging.Logger:
@@ -118,11 +114,9 @@ class MLOptimizerAndBacktester:
             data = json.load(f)
         self.logger.info(f"成功從 {file_path} 載入 {len(data['selected_features'])} 個全域特徵。")
         return data
-    
-    # ★★★【調整 2】: Optuna 的 objective 函式 ★★★
-    # 函式簽名改變，現在從外部接收訓練與驗證數據集
+
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, X_val, y_val) -> float:
-        """Optuna 的目標函數，現在專為單一市場的數據進行優化。"""
+        """Optuna 的目標函數，專為單一市場的數據進行優化。"""
         param = {
             'objective': 'binary',
             'metric': 'binary_logloss',
@@ -145,16 +139,14 @@ class MLOptimizerAndBacktester:
         accuracy = accuracy_score(y_val.values, preds)
         return accuracy
 
-    # ★★★【調整 3】: 新增 run_final_backtest 函式 ★★★
-    # 將回測邏輯獨立出來，方便在迴圈中調用
     def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier, market_name: str):
-        """對單一市場的樣本外數據執行回測並打印/儲存報告。"""
+        """對單一市場的樣本外數據執行回測並打印/儲存報告。(已包含對 None 值的穩健性處理)"""
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
 
         data_feed = PandasDataWithFeatures(dataname=df)
-        cerebro = bt.Cerebro(stdstats=False) # 關閉預設分析器，只用我們自己添加的
+        cerebro = bt.Cerebro(stdstats=False)
         cerebro.adddata(data_feed)
         cerebro.addstrategy(FinalMLStrategy, model=model, features=self.selected_features,
                             entry_threshold=self.config.ENTRY_PROB_THRESHOLD)
@@ -173,7 +165,10 @@ class MLOptimizerAndBacktester:
         final_value = cerebro.broker.getvalue()
         pnl = final_value - self.config.INITIAL_CASH
         trades_analysis = analysis.trades.get_analysis()
-        sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio', 0.0)
+        
+        # 取得夏普比率，它在無交易時可能為 None
+        sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
+        
         max_drawdown = analysis.drawdown.get_analysis().max.drawdown
         total_trades = trades_analysis.total.total
         win_rate = (trades_analysis.won.total / total_trades) if total_trades > 0 else 0.0
@@ -182,24 +177,28 @@ class MLOptimizerAndBacktester:
         self.logger.info("\n" + f"--- {market_name} 樣本外最終回測績效報告 ---")
         self.logger.info(f"  - 最終資產價值: {final_value:,.2f}")
         self.logger.info(f"  - 總淨利: {pnl:,.2f}")
-        self.logger.info(f"  - 夏普比率: {sharpe_ratio:.2f}")
+        
+        # 在打印前檢查 sharpe_ratio 是否為 None
+        if sharpe_ratio is not None:
+            self.logger.info(f"  - 夏普比率: {sharpe_ratio:.2f}")
+        else:
+            self.logger.info("  - 夏普比率: N/A (無交易)")
+            
         self.logger.info(f"  - 最大回撤: {max_drawdown:.2f}%")
         self.logger.info(f"  - 總交易次數: {total_trades}")
         self.logger.info(f"  - 勝率: {win_rate:.2%}")
         self.logger.info("-" * 50)
         
-        # 儲存報告到字典中
+        # 在儲存結果前，將 None 轉換為 0.0，方便後續統一處理
         self.all_backtest_results[market_name] = {
             "final_value": final_value,
             "pnl": pnl,
-            "sharpe_ratio": sharpe_ratio,
+            "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
             "max_drawdown": max_drawdown,
             "total_trades": total_trades,
             "win_rate": win_rate
         }
 
-    # ★★★【調整 4】: 新增 run_for_single_market 函式 ★★★
-    # 這是針對單一市場執行完整流程的核心函式
     def run_for_single_market(self, market_file_path: Path):
         """針對單一市場檔案，執行從數據準備到回測的完整流程。"""
         market_name = market_file_path.stem
@@ -208,7 +207,6 @@ class MLOptimizerAndBacktester:
         # 1. 載入並準備【單一市場】數據
         df = pd.read_parquet(market_file_path)
         
-        # 檢查所需特徵是否存在
         missing_features = [f for f in self.selected_features if f not in df.columns]
         if missing_features:
             self.logger.warning(f"市場 {market_name} 缺少以下特徵，將被忽略: {missing_features}")
@@ -263,14 +261,9 @@ class MLOptimizerAndBacktester:
         # 5. 執行樣本外最終回測
         self.run_final_backtest(df_out_of_sample, final_model, market_name)
 
-
-    # ★★★【調整 5】: 全新的主執行函式 run ★★★
-    # 舊的 run 函式被替換為一個主迴圈，調用上述的單一市場處理函式
-
     def run(self):
         """執行完整的主流程：遍歷所有找到的市場數據檔案並逐一處理。"""
-        # --- ↓↓↓ 修改成這樣即可 ↓↓↓ ---
-        self.logger.info(f"========= 整合式優化與回測流程開始 (版本 3.6 - Per-Market) =========")
+        self.logger.info(f"========= 整合式優化與回測流程開始 (版本 3.7 - Per-Market) =========")
 
         input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
         if not input_files:
@@ -287,7 +280,6 @@ class MLOptimizerAndBacktester:
         
         # 在所有市場處理完畢後，打印總結報告
         self.logger.info("\n" + "="*25 + " 所有市場回測結果總結 " + "="*25)
-        # 將結果轉換為 DataFrame 以便美觀地打印
         if self.all_backtest_results:
             summary_df = pd.DataFrame.from_dict(self.all_backtest_results, orient='index')
             summary_df.index.name = 'Market'
