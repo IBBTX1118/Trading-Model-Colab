@@ -27,9 +27,9 @@ class Config:
 
     # --- Labeling (目標定義) 相關參數 ---
     # 預測未來幾根 K 棒
-    LABEL_LOOK_FORWARD_PERIODS: int = 5
+    LABEL_LOOK_FORWARD_PERIODS: int = 12
     # 目標報酬率閾值 (例如：0.5% -> 0.005)
-    LABEL_RETURN_THRESHOLD: float = 0.005
+    LABEL_RETURN_THRESHOLD: float = 0.003
 
     # --- 模型與特徵篩選相關參數 ---
     # 要選擇最重要的前 N 個特徵
