@@ -1,6 +1,6 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 3.9 (ROC AUC 優化版)
+# 版本: 4.0 (分析增強版：內建回測繪圖與特徵重要性分析)
 
 import logging
 import sys
@@ -13,7 +13,6 @@ import numpy as np
 import backtrader as bt
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
-# 導入 roc_auc_score
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 import optuna
@@ -32,7 +31,6 @@ class Config:
     N_TRIALS = 100
     INITIAL_CASH = 100000.0
     COMMISSION = 0.001
-    # 維持您指定的進場門檻
     ENTRY_PROB_THRESHOLD = 0.50
 
 # ==============================================================================
@@ -78,7 +76,7 @@ class MLOptimizerAndBacktester:
         return data
 
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, X_val, y_val) -> float:
-        """Optuna 的目標函數，現在優化 ROC AUC 分數。"""
+        """Optuna 的目標函數，優化 ROC AUC 分數。"""
         param = {
             'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
             'boosting_type': 'gbdt', 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
@@ -91,9 +89,7 @@ class MLOptimizerAndBacktester:
         }
         model = lgb.LGBMClassifier(**param)
         model.fit(X_train.values, y_train.values)
-        
-        # 改用 roc_auc_score 進行評估
-        pred_probs = model.predict_proba(X_val.values)[:, 1] # 獲取預測為 "上漲" 的機率
+        pred_probs = model.predict_proba(X_val.values)[:, 1]
         return roc_auc_score(y_val.values, pred_probs)
 
     def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier, market_name: str):
@@ -134,6 +130,19 @@ class MLOptimizerAndBacktester:
             "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
             "max_drawdown": max_drawdown, "total_trades": total_trades, "win_rate": win_rate
         }
+
+        # ★★★ 新增功能：繪製並儲存回測圖表 ★★★
+        try:
+            chart_folder = self.config.OUTPUT_BASE_DIR / "charts"
+            chart_folder.mkdir(exist_ok=True)
+            chart_file = chart_folder / f"{market_name}_backtest.png"
+            
+            print(f"資訊: 正在為 {market_name} 繪製回測圖表...")
+            fig = cerebro.plot(style='candlestick', iplot=False, width=32, height=18)[0][0]
+            fig.savefig(chart_file, dpi=300)
+            print(f"資訊: 圖表已儲存至 {chart_file}")
+        except Exception as e:
+            print(f"警告: 繪製圖表時發生錯誤: {e}")
 
     def run_for_single_market(self, market_file_path: Path):
         market_name = market_file_path.stem
@@ -180,10 +189,18 @@ class MLOptimizerAndBacktester:
         final_model = lgb.LGBMClassifier(**study.best_params)
         final_model.fit(X_in_sample.values, y_in_sample.values)
         
+        # ★★★ 新增功能：分析並打印特徵重要性 ★★★
+        print(f"資訊: --- {market_name} 模型最重要的 10 個特徵 ---")
+        feature_importance_df = pd.DataFrame({
+            'feature': current_features,
+            'importance': final_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        print(feature_importance_df.head(10).to_string(index=False))
+        
         self.run_final_backtest(df_out_of_sample, final_model, market_name)
 
     def run(self):
-        print(f"========= 整合式優化與回測流程開始 (版本 3.9 - ROC AUC 優化) =========")
+        print(f"========= 整合式優化與回測流程開始 (版本 4.0 - 內建分析功能) =========")
         input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
         if not input_files:
             print(f"致命錯誤: 在 {self.config.INPUT_DATA_DIR} 中找不到任何數據檔案！流程中止。")
