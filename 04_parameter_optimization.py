@@ -1,6 +1,8 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
 # 版本: 4.0 (分析增強版：內建回測繪圖與特徵重要性分析)
+import matplotlib
+matplotlib.use('Agg')
 
 import logging
 import sys
