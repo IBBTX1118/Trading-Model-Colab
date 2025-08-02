@@ -1,10 +1,7 @@
 # 檔名: 04_ml_model_optimization.py
 # 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 4.0 (分析增強版：內建回測繪圖與特徵重要性分析)
-import matplotlib
-matplotlib.use('Agg')
+# 版本: 4.1 (無圖表簡化版)
 
-import logging
 import sys
 import json
 from pathlib import Path
@@ -15,7 +12,7 @@ import numpy as np
 import backtrader as bt
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 
 import optuna
 
@@ -24,7 +21,7 @@ import optuna
 # ==============================================================================
 class Config:
     INPUT_FEATURES_FILE = Path("Output_ML_Pipeline/selected_features.json")
-    INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_All_Features")
+    INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_Advanced_Features")
     OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
     TRAIN_VALIDATION_SPLIT_DATE = "2023-01-01"
     OUT_OF_SAMPLE_START_DATE = "2024-01-01"
@@ -132,19 +129,8 @@ class MLOptimizerAndBacktester:
             "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
             "max_drawdown": max_drawdown, "total_trades": total_trades, "win_rate": win_rate
         }
-
-        # ★★★ 新增功能：繪製並儲存回測圖表 ★★★
-        try:
-            chart_folder = self.config.OUTPUT_BASE_DIR / "charts"
-            chart_folder.mkdir(exist_ok=True)
-            chart_file = chart_folder / f"{market_name}_backtest.png"
-            
-            print(f"資訊: 正在為 {market_name} 繪製回測圖表...")
-            fig = cerebro.plot(style='candlestick', iplot=False, width=32, height=18)[0][0]
-            fig.savefig(chart_file, dpi=300)
-            print(f"資訊: 圖表已儲存至 {chart_file}")
-        except Exception as e:
-            print(f"警告: 繪製圖表時發生錯誤: {e}")
+        
+        # --- 繪圖功能已在此版本中移除 ---
 
     def run_for_single_market(self, market_file_path: Path):
         market_name = market_file_path.stem
@@ -191,7 +177,6 @@ class MLOptimizerAndBacktester:
         final_model = lgb.LGBMClassifier(**study.best_params)
         final_model.fit(X_in_sample.values, y_in_sample.values)
         
-        # ★★★ 新增功能：分析並打印特徵重要性 ★★★
         print(f"資訊: --- {market_name} 模型最重要的 10 個特徵 ---")
         feature_importance_df = pd.DataFrame({
             'feature': current_features,
@@ -202,7 +187,7 @@ class MLOptimizerAndBacktester:
         self.run_final_backtest(df_out_of_sample, final_model, market_name)
 
     def run(self):
-        print(f"========= 整合式優化與回測流程開始 (版本 4.0 - 內建分析功能) =========")
+        print(f"========= 整合式優化與回測流程開始 (版本 4.1 - 無圖表簡化版) =========")
         input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
         if not input_files:
             print(f"致命錯誤: 在 {self.config.INPUT_DATA_DIR} 中找不到任何數據檔案！流程中止。")
