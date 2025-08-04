@@ -23,8 +23,8 @@ class Config:
     INPUT_FEATURES_FILE = Path("Output_ML_Pipeline/selected_features.json")
     INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_Advanced_Features")
     OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
-    TRAIN_VALIDATION_SPLIT_DATE = "2023-01-01"
-    OUT_OF_SAMPLE_START_DATE = "2024-01-01"
+    TRAIN_VALIDATION_SPLIT_DATE = "2022-01-01"
+    OUT_OF_SAMPLE_START_DATE = "2023-01-01"
     LABEL_LOOK_FORWARD_PERIODS: int = 12
     LABEL_RETURN_THRESHOLD: float = 0.003
     N_TRIALS = 100
