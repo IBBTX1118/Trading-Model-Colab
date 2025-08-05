@@ -4,7 +4,6 @@ pandas
 pyarrow
 finta
 setuptools
-pandas_ta
 
 # 機器學習與特徵篩選
 scikit-learn
