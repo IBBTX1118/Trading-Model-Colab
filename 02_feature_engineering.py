@@ -1,10 +1,11 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 4.0 (深度特徵工程版)
+# 版本: 4.1 (穩定版 - 移除 pandas_ta 依賴)
 
 """
-此腳本為特徵工程的最終擴展版。
+此腳本為特徵工程的擴展版。
 除了標準技術指標，還加入了基於價格行為（K線結構）、
-市場狀態（趨勢/盤整）和突破分析的進階複合特徵。
+市場狀態和突破分析的進階複合特徵。
+版本 4.1 為解決環境衝突，移除了對 pandas_ta 和 ADX 指標的依賴。
 """
 
 import logging
@@ -14,13 +15,12 @@ from typing import List
 import pandas as pd
 import numpy as np
 from finta import TA
-import pandas_ta as pta # ★ 導入新的函式庫
+# ★ 已移除 import pandas_ta as pta
 
-# ... (Config 和 FeatureEngineer 的 __init__, _setup_logger, find_input_files 維持不變) ...
-
+# --- Config 和 FeatureEngineer 的 __init__, _setup_logger, find_input_files 維持不變 ---
 class Config:
     INPUT_BASE_DIR = Path("Output_Data_Pipeline_v2/MarketData")
-    OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features") # 使用新目錄
+    OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features_v2") # 使用新的輸出目錄
     LOG_LEVEL = "INFO"
 
 class FeatureEngineer:
@@ -50,7 +50,7 @@ class FeatureEngineer:
         if df.empty:
             return df
         
-        self.logger.info("計算標準技術指標...")
+        self.logger.info("計算標準及進階技術指標特徵集...")
         df_finta = df.copy()
         df_finta.rename(columns={
             'open': 'open', 'high': 'high', 'low': 'low', 
@@ -58,6 +58,8 @@ class FeatureEngineer:
         }, inplace=True)
 
         # --- 標準 finta 指標 ---
+        df_finta = df_finta.join(TA.DMI(df_finta)) # DMI 必須先計算，因為後續會用到
+        
         standard_indicators = [
             'SMA_10', 'SMA_20', 'SMA_50', 'EMA_10', 'EMA_20', 'EMA_50',
             'RSI_14', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI', 'ATR_14'
@@ -70,12 +72,11 @@ class FeatureEngineer:
             else:
                 df_finta[indicator] = method_to_call(df_finta)
         
-        df_finta = df_finta.join(TA.DMI(df_finta))
         df_finta = df_finta.join(TA.STOCH(df_finta))
         df_finta = df_finta.join(TA.MACD(df_finta))
         df_finta = df_finta.join(TA.BBANDS(df_finta))
 
-        # --- ★★★ 第一階段：進階特徵工程 ★★★ ---
+        # --- 進階特徵工程 ---
         self.logger.info("計算進階複合特徵...")
 
         # 1. K線本體與影線分析
@@ -84,9 +85,7 @@ class FeatureEngineer:
         df_finta['lower_wick'] = df_finta[['open', 'close']].min(axis=1) - df_finta['low']
         df_finta['body_vs_wick'] = df_finta['body_size'] / (df_finta['high'] - df_finta['low'] + 1e-9)
 
-        # 2. 趨勢強度與盤整識別 (使用 pandas_ta 計算 ADX)
-        adx_df = pta.adx(df_finta['high'], df_finta['low'], df_finta['close'], length=14)
-        df_finta['ADX_14'] = adx_df[f'ADX_14']
+        # 2. 趨勢強度識別 (★ 移除 ADX，改用 DMI 的內建值)
         df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
 
         # 3. 價格突破與通道位置
@@ -104,7 +103,6 @@ class FeatureEngineer:
         df_finta.replace([np.inf, -np.inf], np.nan, inplace=True)
         return df_finta
 
-    # ... (process_file 和 run 方法維持不變, 只需確認輸出目錄為新目錄) ...
     def process_file(self, file_path: Path) -> None:
         try:
             self.logger.info(f"--- 開始處理檔案: {file_path.name} ---")
@@ -132,7 +130,7 @@ class FeatureEngineer:
             self.logger.error(f"處理檔案 {file_path.name} 時發生錯誤: {e}", exc_info=True)
 
     def run(self) -> None:
-        self.logger.info("========= 深度特徵工程流程開始 (v4.0) =========")
+        self.logger.info("========= 深度特徵工程流程開始 (v4.1 - 穩定版) =========")
         input_files = self.find_input_files()
         
         if not input_files:
