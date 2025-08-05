@@ -1,15 +1,10 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 3.0 (進階特徵工程版)
+# 版本: 4.0 (深度特徵工程版)
 
 """
-此腳本為特徵工程的擴展版。
-
-它會讀取處理好的市場數據，並使用 finta 函式庫，
-計算出一個包含趨勢、動能、波動率、成交量等多種類別的、
-龐大的技術指標特徵集，為後續的機器學習步驟做準備。
-
-版本 3.0 新增了基於分析得出的進階複合特徵，
-例如布林通道寬度、價格在通道中的位置以及成交量指標的變化率等。
+此腳本為特徵工程的最終擴展版。
+除了標準技術指標，還加入了基於價格行為（K線結構）、
+市場狀態（趨勢/盤整）和突破分析的進階複合特徵。
 """
 
 import logging
@@ -17,22 +12,17 @@ import sys
 from pathlib import Path
 from typing import List
 import pandas as pd
-import numpy as np # 新增 numpy 以處理可能出現的 inf
+import numpy as np
 from finta import TA
+import pandas_ta as pta # ★ 導入新的函式庫
 
-# ==============================================================================
-# 1. 配置區塊
-# ==============================================================================
+# ... (Config 和 FeatureEngineer 的 __init__, _setup_logger, find_input_files 維持不變) ...
+
 class Config:
-    """儲存腳本所需的所有配置參數。"""
     INPUT_BASE_DIR = Path("Output_Data_Pipeline_v2/MarketData")
-    # 更改輸出目錄，以區分舊的特徵檔案
-    OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Advanced_Features")
+    OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features") # 使用新目錄
     LOG_LEVEL = "INFO"
 
-# ==============================================================================
-# 2. 特徵工程師類別
-# ==============================================================================
 class FeatureEngineer:
     def __init__(self, config: Config):
         self.config = config
@@ -57,83 +47,64 @@ class FeatureEngineer:
         return files
 
     def add_features_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        使用 finta 為 DataFrame 添加一個龐大的特徵集，並包含進階複合特徵。
-        """
         if df.empty:
             return df
         
-        self.logger.info("使用 finta 計算標準及進階技術指標特徵集...")
-
-        # --- 準備工作 ---
+        self.logger.info("計算標準技術指標...")
         df_finta = df.copy()
         df_finta.rename(columns={
             'open': 'open', 'high': 'high', 'low': 'low', 
             'close': 'close', 'tick_volume': 'volume'
         }, inplace=True)
 
-        # --- 計算所有 finta 標準指標 ---
+        # --- 標準 finta 指標 ---
+        standard_indicators = [
+            'SMA_10', 'SMA_20', 'SMA_50', 'EMA_10', 'EMA_20', 'EMA_50',
+            'RSI_14', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI', 'ATR_14'
+        ]
+        for indicator in standard_indicators:
+            method_to_call = getattr(TA, indicator.split('_')[0])
+            if '_' in indicator:
+                period = int(indicator.split('_')[1])
+                df_finta[indicator] = method_to_call(df_finta, period=period)
+            else:
+                df_finta[indicator] = method_to_call(df_finta)
         
-        # 趨勢指標 (Trend)
-        df_finta['SMA_10'] = TA.SMA(df_finta, period=10)
-        df_finta['SMA_20'] = TA.SMA(df_finta, period=20)
-        df_finta['SMA_50'] = TA.SMA(df_finta, period=50)
-        df_finta['EMA_10'] = TA.EMA(df_finta, period=10)
-        df_finta['EMA_20'] = TA.EMA(df_finta, period=20)
-        df_finta['EMA_50'] = TA.EMA(df_finta, period=50)
         df_finta = df_finta.join(TA.DMI(df_finta))
-        df_finta['SAR'] = TA.SAR(df_finta)
-        
-        # 動能指標 (Momentum)
-        df_finta['RSI_14'] = TA.RSI(df_finta, period=14)
         df_finta = df_finta.join(TA.STOCH(df_finta))
         df_finta = df_finta.join(TA.MACD(df_finta))
-        df_finta['WILLIAMS'] = TA.WILLIAMS(df_finta)
-        
-        # 波動率指標 (Volatility)
         df_finta = df_finta.join(TA.BBANDS(df_finta))
-        df_finta['ATR_14'] = TA.ATR(df_finta, period=14)
-        
-        # 成交量指標 (Volume)
-        df_finta['OBV'] = TA.OBV(df_finta)
-        df_finta['MFI'] = TA.MFI(df_finta)
-        
-        # 其他指標
-        df_finta['CCI'] = TA.CCI(df_finta)
-        
-        # --- ★★★ 新增進階複合特徵 ★★★ ---
+
+        # --- ★★★ 第一階段：進階特徵工程 ★★★ ---
         self.logger.info("計算進階複合特徵...")
 
-        # 1. 布林通道寬度特徵 (基於波動率)
-        df_finta['BB_WIDTH'] = df_finta['BB_UPPER'] - df_finta['BB_LOWER']
-        # 正規化的寬度，避免價格尺度影響
-        df_finta['BB_WIDTH_RATIO'] = df_finta['BB_WIDTH'] / df_finta['SMA_20']
+        # 1. K線本體與影線分析
+        df_finta['body_size'] = abs(df_finta['close'] - df_finta['open'])
+        df_finta['upper_wick'] = df_finta['high'] - df_finta[['open', 'close']].max(axis=1)
+        df_finta['lower_wick'] = df_finta[['open', 'close']].min(axis=1) - df_finta['low']
+        df_finta['body_vs_wick'] = df_finta['body_size'] / (df_finta['high'] - df_finta['low'] + 1e-9)
 
-        # 2. 價格在布林通道中的位置特徵 (0-1之間)
-        # 加上一個極小的數值避免分母為零的錯誤
-        df_finta['BB_POS'] = (df_finta['close'] - df_finta['BB_LOWER']) / (df_finta['BB_WIDTH'] + 1e-9)
+        # 2. 趨勢強度與盤整識別 (使用 pandas_ta 計算 ADX)
+        adx_df = pta.adx(df_finta['high'], df_finta['low'], df_finta['close'], length=14)
+        df_finta['ADX_14'] = adx_df[f'ADX_14']
+        df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
 
-        # 3. 成交量指標的變化特徵 (基於成交量)
-        df_finta['OBV_SMA_10'] = TA.SMA(df_finta, period=10, column='OBV')
-        df_finta['OBV_PCT_CHANGE_5'] = df_finta['OBV'].pct_change(periods=5)
-        
-        # 4. 更多不同週期的趨勢與動能指標
-        df_finta['SMA_100'] = TA.SMA(df_finta, period=100)
-        df_finta['RSI_28'] = TA.RSI(df_finta, period=28)
-        
-        # 5. 價格與均線的關係
+        # 3. 價格突破與通道位置
+        df_finta['ROLLING_HIGH_20'] = df_finta['high'].rolling(window=20).max()
+        df_finta['ROLLING_LOW_20'] = df_finta['low'].rolling(window=20).min()
+        rolling_range = df_finta['ROLLING_HIGH_20'] - df_finta['ROLLING_LOW_20']
+        df_finta['CLOSE_vs_ROLLING_RANGE'] = (df_finta['close'] - df_finta['ROLLING_LOW_20']) / (rolling_range + 1e-9)
+
+        # 4. 更多既有指標的複合使用
         df_finta['CLOSE_vs_SMA50'] = df_finta['close'] / df_finta['SMA_50']
-        
+        df_finta['SMA_ratio_10_50'] = df_finta['SMA_10'] / df_finta['SMA_50']
+
         # --- 清理與收尾 ---
-        
-        # 將 volume 欄位名稱改回 tick_volume
         df_finta.rename(columns={'volume': 'tick_volume'}, inplace=True)
-        
-        # 處理計算過程中可能產生的無窮大值
         df_finta.replace([np.inf, -np.inf], np.nan, inplace=True)
-        
         return df_finta
 
+    # ... (process_file 和 run 方法維持不變, 只需確認輸出目錄為新目錄) ...
     def process_file(self, file_path: Path) -> None:
         try:
             self.logger.info(f"--- 開始處理檔案: {file_path.name} ---")
@@ -142,28 +113,26 @@ class FeatureEngineer:
             initial_cols = df.shape[1]
             df_with_features = self.add_features_to_dataframe(df)
             
-            # 在儲存前丟棄所有包含 NaN 的行
             rows_before_dropna = len(df_with_features)
             df_with_features.dropna(inplace=True)
             rows_after_dropna = len(df_with_features)
             self.logger.info(f"移除了 {rows_before_dropna - rows_after_dropna} 行包含 NaN 的數據。")
             
             final_cols = df_with_features.shape[1]
-            self.logger.info(f"成功添加了 {final_cols - initial_cols} 個新特徵。")
+            self.logger.info(f"成功添加了 {final_cols - initial_cols} 個新特徵。總特徵數: {final_cols}")
             
-            # 建立與輸入對應的輸出子目錄結構
             relative_path = file_path.relative_to(self.config.INPUT_BASE_DIR)
             output_path = self.config.OUTPUT_BASE_DIR / relative_path
             
             output_path.parent.mkdir(parents=True, exist_ok=True)
             df_with_features.to_parquet(output_path)
-            self.logger.info(f"已儲存帶有進階特徵的檔案到: {output_path}")
+            self.logger.info(f"已儲存帶有深度特徵的檔案到: {output_path}")
 
         except Exception as e:
             self.logger.error(f"處理檔案 {file_path.name} 時發生錯誤: {e}", exc_info=True)
 
     def run(self) -> None:
-        self.logger.info("========= 進階特徵工程流程開始 (v3.0) =========")
+        self.logger.info("========= 深度特徵工程流程開始 (v4.0) =========")
         input_files = self.find_input_files()
         
         if not input_files:
@@ -173,7 +142,7 @@ class FeatureEngineer:
         for file_path in input_files:
             self.process_file(file_path)
             
-        self.logger.info("========= 所有檔案處理完畢，進階特徵工程流程結束 =========")
+        self.logger.info("========= 所有檔案處理完畢，深度特徵工程流程結束 =========")
 
 if __name__ == "__main__":
     try:
