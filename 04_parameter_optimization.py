@@ -1,225 +1,152 @@
-# 檔名: 04_ml_model_optimization.py
-# 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 4.1 (無圖表簡化版)
+# 檔名: 02_feature_engineering.py
+# 版本: 4.1 (穩定版 - 移除 pandas_ta 依賴)
 
+"""
+此腳本為特徵工程的擴展版。
+除了標準技術指標，還加入了基於價格行為（K線結構）、
+市場狀態和突破分析的進階複合特徵。
+版本 4.1 為解決環境衝突，移除了對 pandas_ta 和 ADX 指標的依賴。
+"""
+
+import logging
 import sys
-import json
 from pathlib import Path
-from typing import List, Dict, Any
-
+from typing import List
 import pandas as pd
 import numpy as np
-import backtrader as bt
-import lightgbm as lgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from finta import TA
+# ★ 已移除 import pandas_ta as pta
 
-import optuna
-
-# ==============================================================================
-# 1. 配置區塊
-# ==============================================================================
+# --- Config 和 FeatureEngineer 的 __init__, _setup_logger, find_input_files 維持不變 ---
 class Config:
-    INPUT_FEATURES_FILE = Path("Output_ML_Pipeline/selected_features.json")
-    INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features")
-    OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
-    TRAIN_VALIDATION_SPLIT_DATE = "2022-01-01"
-    OUT_OF_SAMPLE_START_DATE = "2023-01-01"
-    LABEL_LOOK_FORWARD_PERIODS: int = 12
-    LABEL_RETURN_THRESHOLD: float = 0.003
-    N_TRIALS = 100
-    INITIAL_CASH = 100000.0
-    COMMISSION = 0.001
-    ENTRY_PROB_THRESHOLD = 0.50
+    INPUT_BASE_DIR = Path("Output_Data_Pipeline_v2/MarketData")
+    OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features_v2") # 使用新的輸出目錄
+    LOG_LEVEL = "INFO"
 
-# ==============================================================================
-# 2. Backtrader 最終策略
-# ==============================================================================
-class FinalMLStrategy(bt.Strategy):
-    params = (('model', None), ('features', None), ('entry_threshold', 0.50))
-
-    def __init__(self):
-        if not self.p.model or not self.p.features:
-            raise ValueError("模型和特徵列表必須提供！")
-        self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
-
-    def next(self):
-        try:
-            feature_vector = np.array([line[0] for line in self.feature_lines]).reshape(1, -1)
-        except IndexError:
-            return
-        pred_prob = self.p.model.predict_proba(feature_vector)[0][1]
-        if not self.position and pred_prob > self.p.entry_threshold:
-            self.buy()
-        elif self.position and pred_prob < 0.5:
-            self.sell()
-
-# ==============================================================================
-# 3. 主流程控制器
-# ==============================================================================
-class MLOptimizerAndBacktester:
+class FeatureEngineer:
     def __init__(self, config: Config):
         self.config = config
+        self.logger = self._setup_logger()
         self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
-        self.selected_features = self._load_json(self.config.INPUT_FEATURES_FILE)['selected_features']
-        self.all_backtest_results = {}
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    def _load_json(self, file_path: Path) -> Dict:
-        if not file_path.exists():
-            print(f"致命錯誤: 輸入檔案 {file_path} 不存在！請先執行 03_feature_selection.py。")
-            sys.exit(1)
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        print(f"資訊: 成功從 {file_path} 載入 {len(data['selected_features'])} 個全域特徵。")
-        return data
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger(self.__class__.__name__)
+        logger.setLevel(self.config.LOG_LEVEL.upper())
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(formatter)
+        logger.addHandler(sh)
+        return logger
 
-    def objective(self, trial: optuna.trial.Trial, X_train, y_train, X_val, y_val) -> float:
-        """Optuna 的目標函數，優化 ROC AUC 分數。"""
-        param = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'boosting_type': 'gbdt', 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 20, 300),
-            'max_depth': trial.suggest_int('max_depth', 3, 12),
-            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
-            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
-            'seed': 42, 'n_jobs': -1,
-        }
-        model = lgb.LGBMClassifier(**param)
-        model.fit(X_train.values, y_train.values)
-        pred_probs = model.predict_proba(X_val.values)[:, 1]
-        return roc_auc_score(y_val.values, pred_probs)
+    def find_input_files(self) -> List[Path]:
+        self.logger.info(f"正在從 '{self.config.INPUT_BASE_DIR}' 尋找輸入檔案...")
+        files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
+        self.logger.info(f"找到了 {len(files)} 個 Parquet 檔案。")
+        return files
 
-    def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier, market_name: str):
-        class PandasDataWithFeatures(bt.feeds.PandasData):
-            lines = tuple(self.selected_features)
-            params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
-        
-        cerebro = bt.Cerebro(stdstats=False)
-        cerebro.adddata(PandasDataWithFeatures(dataname=df))
-        cerebro.addstrategy(FinalMLStrategy, model=model, features=self.selected_features, entry_threshold=self.config.ENTRY_PROB_THRESHOLD)
-        cerebro.broker.setcash(self.config.INITIAL_CASH)
-        cerebro.broker.setcommission(commission=self.config.COMMISSION)
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
-
-        results = cerebro.run()
-        analysis = results[0].analyzers
-        final_value = cerebro.broker.getvalue()
-        pnl = final_value - self.config.INITIAL_CASH
-        trades_analysis = analysis.trades.get_analysis()
-        sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
-        max_drawdown = analysis.drawdown.get_analysis().max.drawdown
-        total_trades = trades_analysis.total.total
-        win_rate = (trades_analysis.won.total / total_trades) if total_trades > 0 else 0.0
-        
-        print("\n" + f"--- {market_name} 樣本外最終回測績效報告 ---")
-        print(f"  - 最終資產價值: {final_value:,.2f}")
-        print(f"  - 總淨利: {pnl:,.2f}")
-        print(f"  - 夏普比率: {sharpe_ratio:.2f}" if sharpe_ratio is not None else "  - 夏普比率: N/A (無交易)")
-        print(f"  - 最大回撤: {max_drawdown:.2f}%")
-        print(f"  - 總交易次數: {total_trades}")
-        print(f"  - 勝率: {win_rate:.2%}")
-        print("-" * 50)
-        
-        self.all_backtest_results[market_name] = {
-            "final_value": final_value, "pnl": pnl,
-            "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
-            "max_drawdown": max_drawdown, "total_trades": total_trades, "win_rate": win_rate
-        }
-        
-        # --- 繪圖功能已在此版本中移除 ---
-
-    def run_for_single_market(self, market_file_path: Path):
-        market_name = market_file_path.stem
-        print(f"\n{'='*25} 開始處理市場: {market_name} {'='*25}")
-        df = pd.read_parquet(market_file_path)
-        
-        current_features = [f for f in self.selected_features if f in df.columns]
-        if len(current_features) != len(self.selected_features):
-            missing = set(self.selected_features) - set(current_features)
-            print(f"警告: 市場 {market_name} 缺少特徵: {missing}，將被忽略。")
-
-        future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
-        df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.dropna(inplace=True)
-
+    def add_features_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
-            print(f"警告: 市場 {market_name} 在數據清洗後為空，已跳過。")
-            return
-
-        df_in_sample = df[df.index < self.config.OUT_OF_SAMPLE_START_DATE]
-        df_out_of_sample = df[df.index >= self.config.OUT_OF_SAMPLE_START_DATE]
-        if df_in_sample.empty or df_out_of_sample.empty:
-            print(f"警告: 市場 {market_name} 的數據不足以進行樣本內外分割，已跳過。")
-            return
-
-        df_train = df_in_sample[df_in_sample.index < self.config.TRAIN_VALIDATION_SPLIT_DATE]
-        df_val = df_in_sample[df_in_sample.index >= self.config.TRAIN_VALIDATION_SPLIT_DATE]
-        if df_train.empty or df_val.empty:
-            print(f"警告: 市場 {market_name} 的樣本內數據不足以進行訓練/驗證分割，已跳過。")
-            return
-
-        X_train, y_train = df_train[current_features], df_train['target']
-        X_val, y_val = df_val[current_features], df_val['target']
-        print(f"資訊: 數據分割完成: 訓練({len(X_train)}), 驗證({len(X_val)}), 樣本外({len(df_out_of_sample)})")
-
-        print("資訊: --- 開始執行 LightGBM 超參數優化 (目標: ROC AUC) ---")
-        study = optuna.create_study(direction='maximize')
-        study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), n_trials=self.config.N_TRIALS, show_progress_bar=True)
-        print(f"資訊: 超參數優化完成！最佳 ROC AUC 分數: {study.best_value:.4f}")
-
-        print("資訊: --- 使用最佳超參數訓練最終模型 ---")
-        X_in_sample, y_in_sample = df_in_sample[current_features], df_in_sample['target']
-        final_model = lgb.LGBMClassifier(**study.best_params)
-        final_model.fit(X_in_sample.values, y_in_sample.values)
+            return df
         
-        print(f"資訊: --- {market_name} 模型最重要的 10 個特徵 ---")
-        feature_importance_df = pd.DataFrame({
-            'feature': current_features,
-            'importance': final_model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        print(feature_importance_df.head(10).to_string(index=False))
-        
-        self.run_final_backtest(df_out_of_sample, final_model, market_name)
+        self.logger.info("計算標準及進階技術指標特徵集...")
+        df_finta = df.copy()
+        df_finta.rename(columns={
+            'open': 'open', 'high': 'high', 'low': 'low', 
+            'close': 'close', 'tick_volume': 'volume'
+        }, inplace=True)
 
-    def run(self):
-        print(f"========= 整合式優化與回測流程開始 (版本 4.1 - 無圖表簡化版) =========")
-        input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
+        # --- 標準 finta 指標 ---
+        df_finta = df_finta.join(TA.DMI(df_finta)) # DMI 必須先計算，因為後續會用到
+        
+        standard_indicators = [
+            'SMA_10', 'SMA_20', 'SMA_50', 'EMA_10', 'EMA_20', 'EMA_50',
+            'RSI_14', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI', 'ATR_14'
+        ]
+        for indicator in standard_indicators:
+            method_to_call = getattr(TA, indicator.split('_')[0])
+            if '_' in indicator:
+                period = int(indicator.split('_')[1])
+                df_finta[indicator] = method_to_call(df_finta, period=period)
+            else:
+                df_finta[indicator] = method_to_call(df_finta)
+        
+        df_finta = df_finta.join(TA.STOCH(df_finta))
+        df_finta = df_finta.join(TA.MACD(df_finta))
+        df_finta = df_finta.join(TA.BBANDS(df_finta))
+
+        # --- 進階特徵工程 ---
+        self.logger.info("計算進階複合特徵...")
+
+        # 1. K線本體與影線分析
+        df_finta['body_size'] = abs(df_finta['close'] - df_finta['open'])
+        df_finta['upper_wick'] = df_finta['high'] - df_finta[['open', 'close']].max(axis=1)
+        df_finta['lower_wick'] = df_finta[['open', 'close']].min(axis=1) - df_finta['low']
+        df_finta['body_vs_wick'] = df_finta['body_size'] / (df_finta['high'] - df_finta['low'] + 1e-9)
+
+        # 2. 趨勢強度識別 (★ 移除 ADX，改用 DMI 的內建值)
+        df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
+
+        # 3. 價格突破與通道位置
+        df_finta['ROLLING_HIGH_20'] = df_finta['high'].rolling(window=20).max()
+        df_finta['ROLLING_LOW_20'] = df_finta['low'].rolling(window=20).min()
+        rolling_range = df_finta['ROLLING_HIGH_20'] - df_finta['ROLLING_LOW_20']
+        df_finta['CLOSE_vs_ROLLING_RANGE'] = (df_finta['close'] - df_finta['ROLLING_LOW_20']) / (rolling_range + 1e-9)
+
+        # 4. 更多既有指標的複合使用
+        df_finta['CLOSE_vs_SMA50'] = df_finta['close'] / df_finta['SMA_50']
+        df_finta['SMA_ratio_10_50'] = df_finta['SMA_10'] / df_finta['SMA_50']
+
+        # --- 清理與收尾 ---
+        df_finta.rename(columns={'volume': 'tick_volume'}, inplace=True)
+        df_finta.replace([np.inf, -np.inf], np.nan, inplace=True)
+        return df_finta
+
+    def process_file(self, file_path: Path) -> None:
+        try:
+            self.logger.info(f"--- 開始處理檔案: {file_path.name} ---")
+            df = pd.read_parquet(file_path)
+            
+            initial_cols = df.shape[1]
+            df_with_features = self.add_features_to_dataframe(df)
+            
+            rows_before_dropna = len(df_with_features)
+            df_with_features.dropna(inplace=True)
+            rows_after_dropna = len(df_with_features)
+            self.logger.info(f"移除了 {rows_before_dropna - rows_after_dropna} 行包含 NaN 的數據。")
+            
+            final_cols = df_with_features.shape[1]
+            self.logger.info(f"成功添加了 {final_cols - initial_cols} 個新特徵。總特徵數: {final_cols}")
+            
+            relative_path = file_path.relative_to(self.config.INPUT_BASE_DIR)
+            output_path = self.config.OUTPUT_BASE_DIR / relative_path
+            
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            df_with_features.to_parquet(output_path)
+            self.logger.info(f"已儲存帶有深度特徵的檔案到: {output_path}")
+
+        except Exception as e:
+            self.logger.error(f"處理檔案 {file_path.name} 時發生錯誤: {e}", exc_info=True)
+
+    def run(self) -> None:
+        self.logger.info("========= 深度特徵工程流程開始 (v4.1 - 穩定版) =========")
+        input_files = self.find_input_files()
+        
         if not input_files:
-            print(f"致命錯誤: 在 {self.config.INPUT_DATA_DIR} 中找不到任何數據檔案！流程中止。")
+            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。")
             return
-        
-        print(f"資訊: 找到 {len(input_files)} 個市場檔案，將逐一進行優化與回測。")
-        for market_file in input_files:
-            try:
-                self.run_for_single_market(market_file)
-            except Exception as e:
-                print(f"錯誤: 處理市場 {market_file.name} 時發生未預期的錯誤: {e}")
 
-        print("\n" + "="*25 + " 所有市場回測結果總結 " + "="*25)
-        if self.all_backtest_results:
-            summary_df = pd.DataFrame.from_dict(self.all_backtest_results, orient='index')
-            summary_df.index.name = 'Market'
-            summary_df['final_value'] = summary_df['final_value'].map('{:,.2f}'.format)
-            summary_df['pnl'] = summary_df['pnl'].map('{:,.2f}'.format)
-            summary_df['sharpe_ratio'] = summary_df['sharpe_ratio'].map('{:.2f}'.format)
-            summary_df['max_drawdown'] = summary_df['max_drawdown'].map('{:.2f}%'.format)
-            summary_df['win_rate'] = summary_df['win_rate'].map('{:.2%}'.format)
-            print("\n" + summary_df.to_string())
-        else:
-            print("資訊: 沒有任何市場完成回測。")
-        print("=" * 70)
-        print("========= 所有任務執行完畢，流程結束 =========")
+        for file_path in input_files:
+            self.process_file(file_path)
+            
+        self.logger.info("========= 所有檔案處理完畢，深度特徵工程流程結束 =========")
 
 if __name__ == "__main__":
     try:
         config = Config()
-        optimizer = MLOptimizerAndBacktester(config)
-        optimizer.run()
+        engineer = FeatureEngineer(config)
+        engineer.run()
     except Exception as e:
-        print(f"腳本執行時發生未預期的嚴重錯誤: {e}")
+        logging.critical(f"特徵工程腳本執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
         sys.exit(1)
