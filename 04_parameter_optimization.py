@@ -19,7 +19,7 @@ from finta import TA
 
 # --- Config 和 FeatureEngineer 的 __init__, _setup_logger, find_input_files 維持不變 ---
 class Config:
-    INPUT_BASE_DIR = Path("Output_Data_Pipeline_v2/MarketData")
+    INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features_v2")
     OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features_v2") # 使用新的輸出目錄
     LOG_LEVEL = "INFO"
 
