@@ -19,7 +19,7 @@ from sklearn.metrics import accuracy_score, classification_report
 class Config:
     """儲存腳本所需的所有配置參數。"""
     # 輸入目錄：來自 02_feature_engineering.py 的輸出
-    INPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features")
+    INPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features_v2")
     
     # 輸出目錄：儲存機器學習流程的產出
     OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
