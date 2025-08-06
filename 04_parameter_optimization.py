@@ -129,13 +129,13 @@ class MLOptimizerAndBacktester:
         return roc_auc_score(y_val.values, pred_probs)
 
     def run_backtest_on_fold(self, df_test: pd.DataFrame, model: lgb.LGBMClassifier) -> Dict:
-        """在單一滾動窗口的測試集上執行回測"""
+        """在單一滾動窗口的測試集上執行回測（★★ 版本更新：更穩健的結果提取 ★★）"""
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
         
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.adddata(PandasDataWithFeatures(dataname=df_test))
+        cerebro.adddata(PandasDataWithFeatures(datame=df_test))
         
         strategy_kwargs = {
             'model': model, 
@@ -158,14 +158,27 @@ class MLOptimizerAndBacktester:
         drawdown_analysis = analysis.drawdown.get_analysis()
         sharpe_analysis = analysis.sharpe.get_analysis()
         
-        return {
-            "pnl": trades_analysis.pnl.net.total,
-            "total_trades": trades_analysis.total.total,
-            "won_trades": trades_analysis.won.total,
-            "lost_trades": trades_analysis.lost.total,
-            "max_drawdown": drawdown_analysis.max.drawdown,
-            "sharpe_ratio": sharpe_analysis.get('sharperatio', 0.0)
-        }
+        # ★★★ 核心修正點：先判斷是否有交易，再提取結果 ★★★
+        if trades_analysis.total.total > 0:
+            # 如果有交易，正常提取數據
+            return {
+                "pnl": trades_analysis.pnl.net.total,
+                "total_trades": trades_analysis.total.total,
+                "won_trades": trades_analysis.won.total,
+                "lost_trades": trades_analysis.lost.total,
+                "max_drawdown": drawdown_analysis.max.drawdown,
+                "sharpe_ratio": sharpe_analysis.get('sharperatio', 0.0)
+            }
+        else:
+            # 如果沒有交易，返回預設的 0 值
+            return {
+                "pnl": 0.0,
+                "total_trades": 0,
+                "won_trades": 0,
+                "lost_trades": 0,
+                "max_drawdown": 0.0,
+                "sharpe_ratio": 0.0
+            }
 
     def run_for_single_market(self, market_file_path: Path):
         market_name = market_file_path.stem
