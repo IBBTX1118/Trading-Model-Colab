@@ -1,69 +1,102 @@
-# 檔名: 04_ml_model_optimization.py
-# 描述: 整合 ML 模型超參數優化與最終樣本外回測的完整流程。
-# 版本: 4.1 (無圖表簡化版)
+# 檔名: 04_parameter_optimization.py
+# 描述: 整合滾動優化 (Walk-Forward Optimization)、ATR 風險管理與超參數調整的完整流程。
+# 版本: 5.0 (Phase 1 實作版)
 
 import sys
+import yaml # ★★★ 新增: 用於讀取 YAML 設定檔
 import json
 from pathlib import Path
 from typing import List, Dict, Any
-
 import pandas as pd
 import numpy as np
+from datetime import timedelta # ★★★ 新增: 用於時間計算
+
 import backtrader as bt
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
-
 import optuna
 
 # ==============================================================================
-# 1. 配置區塊
+# 1. 載入全域設定
 # ==============================================================================
-class Config:
-    INPUT_FEATURES_FILE = Path("Output_ML_Pipeline/selected_features.json")
-    # ★ 確保這裡的路徑與 02 腳本的輸出路徑一致 ★
-    INPUT_DATA_DIR = Path("Output_Feature_Engineering/MarketData_with_Deep_Features_v2")
-    OUTPUT_BASE_DIR = Path("Output_ML_Pipeline")
-    TRAIN_VALIDATION_SPLIT_DATE = "2023-01-01"
-    OUT_OF_SAMPLE_START_DATE = "2024-01-01"
-    LABEL_LOOK_FORWARD_PERIODS: int = 12
-    LABEL_RETURN_THRESHOLD: float = 0.003
-    N_TRIALS = 100
-    INITIAL_CASH = 100000.0
-    COMMISSION = 0.001
-    ENTRY_PROB_THRESHOLD = 0.50
+def load_config(config_path: str = 'config.yaml') -> Dict:
+    """從 YAML 檔案載入全域設定"""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"致命錯誤: 設定檔 {config_path} 不存在！")
+        sys.exit(1)
+    except Exception as e:
+        print(f"致命錯誤: 讀取設定檔 {config_path} 時發生錯誤: {e}")
+        sys.exit(1)
 
 # ==============================================================================
-# 2. Backtrader 最終策略
+# 2. Backtrader 最終策略 (★★★ 全新版本，整合 ATR 風險管理 ★★★)
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
-    params = (('model', None), ('features', None), ('entry_threshold', 0.50))
+    params = (
+        ('model', None),
+        ('features', None),
+        ('entry_threshold', 0.60),
+        ('atr_period', 14),
+        ('atr_sl_multiplier', 2.0),
+        ('atr_tp_multiplier', 3.0),
+    )
 
     def __init__(self):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
 
     def next(self):
+        # 如果有訂單正在處理或已在場內，則不執行任何操作
+        if self.order or self.position:
+            return
+
         try:
+            # 獲取當前 K 棒的特徵向量
             feature_vector = np.array([line[0] for line in self.feature_lines]).reshape(1, -1)
         except IndexError:
-            return
+            return # 數據不足，無法計算特徵
+
+        # 預測進場機率
         pred_prob = self.p.model.predict_proba(feature_vector)[0][1]
-        if not self.position and pred_prob > self.p.entry_threshold:
-            self.buy()
-        elif self.position and pred_prob < 0.5:
-            self.sell()
+
+        if pred_prob > self.p.entry_threshold:
+            current_price = self.data.close[0]
+            current_atr = self.atr[0]
+
+            # 計算停損價與停利價
+            sl_price = current_price - self.p.atr_sl_multiplier * current_atr
+            tp_price = current_price + self.p.atr_tp_multiplier * current_atr
+            
+            # 使用 buy_bracket 送出帶有停損停利的掛單
+            # 這會建立一個進場單，以及一個 OCO (One-Cancels-Other) 訂單組 (一個停利，一個停損)
+            self.buy_bracket(
+                price=current_price,
+                stopprice=sl_price,
+                limitprice=tp_price,
+            )
 
 # ==============================================================================
-# 3. 主流程控制器
+# 3. 主流程控制器 (★★★ 重構以實現滾動優化 ★★★)
 # ==============================================================================
 class MLOptimizerAndBacktester:
-    def __init__(self, config: Config):
+    def __init__(self, config: Dict):
         self.config = config
-        self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
-        self.selected_features = self._load_json(self.config.INPUT_FEATURES_FILE)['selected_features']
-        self.all_backtest_results = {}
+        self.paths = config['paths']
+        self.wfo_config = config['walk_forward_optimization']
+        self.strategy_params = config['strategy_params']
+        
+        self.output_base_dir = Path(self.paths['ml_pipeline_output'])
+        self.output_base_dir.mkdir(parents=True, exist_ok=True)
+        
+        features_file = self.output_base_dir / self.paths['selected_features_filename']
+        self.selected_features = self._load_json(features_file)['selected_features']
+        
+        self.all_market_results = {}
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path) -> Dict:
@@ -79,10 +112,11 @@ class MLOptimizerAndBacktester:
         """Optuna 的目標函數，優化 ROC AUC 分數。"""
         param = {
             'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'boosting_type': 'gbdt', 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+            'boosting_type': 'gbdt',
+            'n_estimators': trial.suggest_int('n_estimators', 100, 800),
             'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 20, 300),
-            'max_depth': trial.suggest_int('max_depth', 3, 12),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 200),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
             'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
             'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
             'seed': 42, 'n_jobs': -1,
@@ -92,133 +126,179 @@ class MLOptimizerAndBacktester:
         pred_probs = model.predict_proba(X_val.values)[:, 1]
         return roc_auc_score(y_val.values, pred_probs)
 
-    def run_final_backtest(self, df: pd.DataFrame, model: lgb.LGBMClassifier, market_name: str):
+    def run_backtest_on_fold(self, df_test: pd.DataFrame, model: lgb.LGBMClassifier) -> Dict:
+        """在單一滾動窗口的測試集上執行回測"""
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
         
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.adddata(PandasDataWithFeatures(dataname=df))
-        cerebro.addstrategy(FinalMLStrategy, model=model, features=self.selected_features, entry_threshold=self.config.ENTRY_PROB_THRESHOLD)
-        cerebro.broker.setcash(self.config.INITIAL_CASH)
-        cerebro.broker.setcommission(commission=self.config.COMMISSION)
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+        cerebro.adddata(PandasDataWithFeatures(dataname=df_test))
+        
+        # 傳入策略參數
+        strategy_kwargs = {
+            'model': model, 
+            'features': self.selected_features,
+            **self.strategy_params # 解包 YAML 中的策略參數
+        }
+        cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
+        
+        cerebro.broker.setcash(self.wfo_config['initial_cash'])
+        cerebro.broker.setcommission(commission=self.wfo_config['commission'])
+        
+        # 添加分析器
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
+        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
 
+        # 執行回測
         results = cerebro.run()
+        
+        # 提取分析結果
         analysis = results[0].analyzers
-        final_value = cerebro.broker.getvalue()
-        pnl = final_value - self.config.INITIAL_CASH
         trades_analysis = analysis.trades.get_analysis()
-        sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
-        max_drawdown = analysis.drawdown.get_analysis().max.drawdown
-        total_trades = trades_analysis.total.total
-        win_rate = (trades_analysis.won.total / total_trades) if total_trades > 0 else 0.0
+        drawdown_analysis = analysis.drawdown.get_analysis()
+        sharpe_analysis = analysis.sharpe.get_analysis()
         
-        print("\n" + f"--- {market_name} 樣本外最終回測績效報告 ---")
-        print(f"  - 最終資產價值: {final_value:,.2f}")
-        print(f"  - 總淨利: {pnl:,.2f}")
-        print(f"  - 夏普比率: {sharpe_ratio:.2f}" if sharpe_ratio is not None else "  - 夏普比率: N/A (無交易)")
-        print(f"  - 最大回撤: {max_drawdown:.2f}%")
-        print(f"  - 總交易次數: {total_trades}")
-        print(f"  - 勝率: {win_rate:.2%}")
-        print("-" * 50)
-        
-        self.all_backtest_results[market_name] = {
-            "final_value": final_value, "pnl": pnl,
-            "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
-            "max_drawdown": max_drawdown, "total_trades": total_trades, "win_rate": win_rate
+        return {
+            "pnl": trades_analysis.pnl.net.total,
+            "total_trades": trades_analysis.total.total,
+            "won_trades": trades_analysis.won.total,
+            "lost_trades": trades_analysis.lost.total,
+            "max_drawdown": drawdown_analysis.max.drawdown,
+            "sharpe_ratio": sharpe_analysis.get('sharperatio', 0.0)
         }
 
     def run_for_single_market(self, market_file_path: Path):
         market_name = market_file_path.stem
         print(f"\n{'='*25} 開始處理市場: {market_name} {'='*25}")
-        df = pd.read_parquet(market_file_path)
         
-        current_features = [f for f in self.selected_features if f in df.columns]
-        if len(current_features) != len(self.selected_features):
-            missing = set(self.selected_features) - set(current_features)
-            print(f"警告: 市場 {market_name} 缺少特徵: {missing}，將被忽略。")
+        df = pd.read_parquet(market_file_path)
+        df.index = pd.to_datetime(df.index)
 
-        # ★★★ 核心邏輯：直接使用已有的特徵，不再重新計算 ★★★
-        # 創建 Label
-        future_returns = df['close'].shift(-self.config.LABEL_LOOK_FORWARD_PERIODS) / df['close'] - 1
-        df['target'] = (future_returns > self.config.LABEL_RETURN_THRESHOLD).astype(int)
+        # 創建 Label (這部分邏輯與 03 腳本相同)
+        label_config = self.config['feature_selection']
+        future_returns = df['close'].shift(-label_config['label_look_forward_periods']) / df['close'] - 1
+        df['target'] = (future_returns > label_config['label_return_threshold']).astype(int)
+        
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
-
+        
         if df.empty:
             print(f"警告: 市場 {market_name} 在數據清洗後為空，已跳過。")
             return
 
-        df_in_sample = df[df.index < self.config.OUT_OF_SAMPLE_START_DATE]
-        df_out_of_sample = df[df.index >= self.config.OUT_OF_SAMPLE_START_DATE]
-        if df_in_sample.empty or df_out_of_sample.empty:
-            print(f"警告: 市場 {market_name} 的數據不足以進行樣本內外分割，已跳過。")
-            return
-
-        df_train = df_in_sample[df_in_sample.index < self.config.TRAIN_VALIDATION_SPLIT_DATE]
-        df_val = df_in_sample[df_in_sample.index >= self.config.TRAIN_VALIDATION_SPLIT_DATE]
-        if df_train.empty or df_val.empty:
-            print(f"警告: 市場 {market_name} 的樣本內數據不足以進行訓練/驗證分割，已跳過。")
-            return
-
-        X_train, y_train = df_train[current_features], df_train['target']
-        X_val, y_val = df_val[current_features], df_val['target']
-        print(f"資訊: 數據分割完成: 訓練({len(X_train)}), 驗證({len(X_val)}), 樣本外({len(df_out_of_sample)})")
-
-        print("資訊: --- 開始執行 LightGBM 超參數優化 (目標: ROC AUC) ---")
-        study = optuna.create_study(direction='maximize')
-        study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), n_trials=self.config.N_TRIALS, show_progress_bar=True)
-        print(f"資訊: 超參數優化完成！最佳 ROC AUC 分數: {study.best_value:.4f}")
-
-        print("資訊: --- 使用最佳超參數訓練最終模型 ---")
-        X_in_sample, y_in_sample = df_in_sample[current_features], df_in_sample['target']
-        final_model = lgb.LGBMClassifier(**study.best_params)
-        final_model.fit(X_in_sample.values, y_in_sample.values)
+        # --- 滾動優化主循環 ---
+        start_date = df.index.min()
+        end_date = df.index.max()
         
-        print(f"資訊: --- {market_name} 模型最重要的 10 個特徵 ---")
-        feature_importance_df = pd.DataFrame({
-            'feature': current_features,
-            'importance': final_model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        print(feature_importance_df.head(10).to_string(index=False))
+        train_days = timedelta(days=self.wfo_config['training_days'])
+        val_days = timedelta(days=self.wfo_config['validation_days'])
+        test_days = timedelta(days=self.wfo_config['testing_days'])
+        step_days = timedelta(days=self.wfo_config['step_days'])
+
+        current_date = start_date
+        fold_results = []
+        fold_number = 0
+
+        while current_date + train_days + val_days + test_days <= end_date:
+            fold_number += 1
+            train_start = current_date
+            val_start = train_start + train_days
+            test_start = val_start + val_days
+            test_end = test_start + test_days
+            
+            print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
+
+            # 數據分割
+            df_train = df[train_start:val_start]
+            df_val = df[val_start:test_start]
+            df_test = df[test_start:test_end]
+
+            if df_train.empty or df_val.empty or df_test.empty:
+                print("警告: 當前窗口數據不足，跳過此 Fold。")
+                current_date += step_days
+                continue
+
+            # 準備數據
+            X_train, y_train = df_train[self.selected_features], df_train['target']
+            X_val, y_val = df_val[self.selected_features], df_val['target']
+
+            # 執行 Optuna 超參數優化
+            study = optuna.create_study(direction='maximize')
+            study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), 
+                           n_trials=self.wfo_config['n_trials'], show_progress_bar=False)
+            
+            # 使用最佳參數在 (訓練集+驗證集) 上訓練最終模型
+            X_in_sample = pd.concat([X_train, X_val])
+            y_in_sample = pd.concat([y_train, y_val])
+            final_model = lgb.LGBMClassifier(**study.best_params)
+            final_model.fit(X_in_sample.values, y_in_sample.values)
+            
+            # 在測試集上執行回測
+            result = self.run_backtest_on_fold(df_test, final_model)
+            fold_results.append(result)
+            print(f"Fold {fold_number} 結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={(result['won_trades']/result['total_trades']*100 if result['total_trades']>0 else 0):.2f}%")
+            
+            # 滾動到下一個窗口
+            current_date += step_days
+
+        # --- 彙總所有 Folds 的結果 ---
+        if not fold_results:
+            print(f"\n市場 {market_name} 沒有足夠的數據來完成任何一次滾動回測。")
+            return
+            
+        final_pnl = sum(r['pnl'] for r in fold_results)
+        total_trades = sum(r['total_trades'] for r in fold_results)
+        won_trades = sum(r['won_trades'] for r in fold_results)
+        win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
+        # 注意: max_drawdown 和 sharpe_ratio 的彙總是複雜的，這裡只取平均值作為參考
+        avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
+        avg_sharpe_ratio = np.mean([r['sharpe_ratio'] for r in fold_results])
         
-        self.run_final_backtest(df_out_of_sample, final_model, market_name)
+        print("\n" + f"--- {market_name} 滾動優化總結報告 ---")
+        print(f"  - 總淨利: {final_pnl:,.2f}")
+        print(f"  - 總交易次數: {total_trades}")
+        print(f"  - 總勝率: {win_rate:.2%}")
+        print(f"  - 平均最大回撤: {avg_max_drawdown:.2f}%")
+        print(f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}")
+        print("-" * 50)
+        
+        self.all_market_results[market_name] = {
+            "final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate
+        }
+
 
     def run(self):
-        print(f"========= 整合式優化與回測流程開始 (版本 4.1 - 無圖表簡化版) =========")
-        input_files = list(self.config.INPUT_DATA_DIR.rglob("*.parquet"))
+        print(f"========= 整合式滾動優化與回測流程開始 (版本 5.0) =========")
+        input_dir = Path(self.paths['features_data'])
+        input_files = list(input_dir.rglob("*.parquet"))
+        
         if not input_files:
-            print(f"致命錯誤: 在 {self.config.INPUT_DATA_DIR} 中找不到任何數據檔案！流程中止。")
+            print(f"致命錯誤: 在 {input_dir} 中找不到任何數據檔案！流程中止。")
             return
         
-        print(f"資訊: 找到 {len(input_files)} 個市場檔案，將逐一進行優化與回測。")
-        for market_file in input_files:
+        for market_file in sorted(input_files):
             try:
                 self.run_for_single_market(market_file)
             except Exception as e:
                 print(f"錯誤: 處理市場 {market_file.name} 時發生未預期的錯誤: {e}")
 
-        print("\n" + "="*25 + " 所有市場回測結果總結 " + "="*25)
-        if self.all_backtest_results:
-            summary_df = pd.DataFrame.from_dict(self.all_backtest_results, orient='index')
+        # 最後打印所有市場的簡易總結
+        print("\n" + "="*25 + " 所有市場滾動回測最終總結 " + "="*25)
+        if self.all_market_results:
+            summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index')
             summary_df.index.name = 'Market'
-            summary_df['final_value'] = summary_df['final_value'].map('{:,.2f}'.format)
-            summary_df['pnl'] = summary_df['pnl'].map('{:,.2f}'.format)
-            summary_df['sharpe_ratio'] = summary_df['sharpe_ratio'].map('{:.2f}'.format)
-            summary_df['max_drawdown'] = summary_df['max_drawdown'].map('{:.2f}%'.format)
-            summary_df['win_rate'] = summary_df['win_rate'].map('{:.2%}'.format)
             print("\n" + summary_df.to_string())
         else:
             print("資訊: 沒有任何市場完成回測。")
+
         print("=" * 70)
         print("========= 所有任務執行完畢，流程結束 =========")
 
 if __name__ == "__main__":
     try:
-        config = Config()
+        config = load_config()
         optimizer = MLOptimizerAndBacktester(config)
         optimizer.run()
     except Exception as e:
