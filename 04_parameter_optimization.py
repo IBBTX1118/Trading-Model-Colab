@@ -135,7 +135,7 @@ class MLOptimizerAndBacktester:
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
         
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.adddata(PandasDataWithFeatures(datame=df_test))
+        cerebro.adddata(PandasDataWithFeatures(dataname=df_test))
         
         strategy_kwargs = {
             'model': model, 
