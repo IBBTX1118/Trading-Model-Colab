@@ -52,7 +52,7 @@ class FinalMLStrategy(bt.Strategy):
 
     def next(self):
         # 如果有訂單正在處理或已在場內，則不執行任何操作
-        if self.order or self.position:
+        if self.position:
             return
 
         try:
