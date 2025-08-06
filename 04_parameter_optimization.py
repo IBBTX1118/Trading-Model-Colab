@@ -1,15 +1,15 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 整合滾動優化 (Walk-Forward Optimization)、ATR 風險管理與超參數調整的完整流程。
-# 版本: 5.0 (Phase 1 實作版)
+# 版本: 5.1 (穩定版)
 
 import sys
-import yaml # ★★★ 新增: 用於讀取 YAML 設定檔
+import yaml
 import json
 from pathlib import Path
 from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
-from datetime import timedelta # ★★★ 新增: 用於時間計算
+from datetime import timedelta
 
 import backtrader as bt
 import lightgbm as lgb
@@ -25,14 +25,14 @@ def load_config(config_path: str = 'config.yaml') -> Dict:
         with open(config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     except FileNotFoundError:
-        print(f"致命錯誤: 設定檔 {config_path} 不存在！")
+        print(f"致命錯誤: 設定檔 {config_path} 不存在！請確認路徑。")
         sys.exit(1)
     except Exception as e:
         print(f"致命錯誤: 讀取設定檔 {config_path} 時發生錯誤: {e}")
         sys.exit(1)
 
 # ==============================================================================
-# 2. Backtrader 最終策略 (★★★ 全新版本，整合 ATR 風險管理 ★★★)
+# 2. Backtrader 最終策略 (整合 ATR 風險管理與錯誤修正)
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
@@ -51,7 +51,8 @@ class FinalMLStrategy(bt.Strategy):
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
 
     def next(self):
-        # 如果有訂單正在處理或已在場內，則不執行任何操作
+        # ★★★ 修正點：只檢查 self.position，語法最簡潔且正確 ★★★
+        # 如果已在場內，則不執行任何新操作
         if self.position:
             return
 
@@ -67,24 +68,22 @@ class FinalMLStrategy(bt.Strategy):
         if pred_prob > self.p.entry_threshold:
             current_price = self.data.close[0]
             current_atr = self.atr[0]
-            
-            # ★★★ 新增保護機制：確保 ATR 是有效的正數才下單 ★★★
-            if current_atr > 0:
 
-            # 計算停損價與停利價
-            sl_price = current_price - self.p.atr_sl_multiplier * current_atr
-            tp_price = current_price + self.p.atr_tp_multiplier * current_atr
-            
-            # 使用 buy_bracket 送出帶有停損停利的掛單
-            # 這會建立一個進場單，以及一個 OCO (One-Cancels-Other) 訂單組 (一個停利，一個停損)
-            self.buy_bracket(
-                price=current_price,
-                stopprice=sl_price,
-                limitprice=tp_price,
-            )
+            # ★★★ 修正點：新增保護機制，確保 ATR 是有效的正數才下單 ★★★
+            if current_atr > 0:
+                # 計算停損價與停利價
+                sl_price = current_price - self.p.atr_sl_multiplier * current_atr
+                tp_price = current_price + self.p.atr_tp_multiplier * current_atr
+                
+                # 使用 buy_bracket 送出帶有停損停利的掛單
+                self.buy_bracket(
+                    price=current_price,
+                    stopprice=sl_price,
+                    limitprice=tp_price,
+                )
 
 # ==============================================================================
-# 3. 主流程控制器 (★★★ 重構以實現滾動優化 ★★★)
+# 3. 主流程控制器 (實現滾動優化)
 # ==============================================================================
 class MLOptimizerAndBacktester:
     def __init__(self, config: Dict):
@@ -138,26 +137,22 @@ class MLOptimizerAndBacktester:
         cerebro = bt.Cerebro(stdstats=False)
         cerebro.adddata(PandasDataWithFeatures(dataname=df_test))
         
-        # 傳入策略參數
         strategy_kwargs = {
             'model': model, 
             'features': self.selected_features,
-            **self.strategy_params # 解包 YAML 中的策略參數
+            **self.strategy_params
         }
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
         
         cerebro.broker.setcash(self.wfo_config['initial_cash'])
         cerebro.broker.setcommission(commission=self.wfo_config['commission'])
         
-        # 添加分析器
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
 
-        # 執行回測
         results = cerebro.run()
         
-        # 提取分析結果
         analysis = results[0].analyzers
         trades_analysis = analysis.trades.get_analysis()
         drawdown_analysis = analysis.drawdown.get_analysis()
@@ -179,7 +174,6 @@ class MLOptimizerAndBacktester:
         df = pd.read_parquet(market_file_path)
         df.index = pd.to_datetime(df.index)
 
-        # 創建 Label (這部分邏輯與 03 腳本相同)
         label_config = self.config['feature_selection']
         future_returns = df['close'].shift(-label_config['label_look_forward_periods']) / df['close'] - 1
         df['target'] = (future_returns > label_config['label_return_threshold']).astype(int)
@@ -213,7 +207,6 @@ class MLOptimizerAndBacktester:
             
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
 
-            # 數據分割
             df_train = df[train_start:val_start]
             df_val = df[val_start:test_start]
             df_test = df[test_start:test_end]
@@ -223,30 +216,24 @@ class MLOptimizerAndBacktester:
                 current_date += step_days
                 continue
 
-            # 準備數據
             X_train, y_train = df_train[self.selected_features], df_train['target']
             X_val, y_val = df_val[self.selected_features], df_val['target']
 
-            # 執行 Optuna 超參數優化
             study = optuna.create_study(direction='maximize')
             study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), 
                            n_trials=self.wfo_config['n_trials'], show_progress_bar=False)
             
-            # 使用最佳參數在 (訓練集+驗證集) 上訓練最終模型
             X_in_sample = pd.concat([X_train, X_val])
             y_in_sample = pd.concat([y_train, y_val])
             final_model = lgb.LGBMClassifier(**study.best_params)
             final_model.fit(X_in_sample.values, y_in_sample.values)
             
-            # 在測試集上執行回測
             result = self.run_backtest_on_fold(df_test, final_model)
             fold_results.append(result)
             print(f"Fold {fold_number} 結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={(result['won_trades']/result['total_trades']*100 if result['total_trades']>0 else 0):.2f}%")
             
-            # 滾動到下一個窗口
             current_date += step_days
 
-        # --- 彙總所有 Folds 的結果 ---
         if not fold_results:
             print(f"\n市場 {market_name} 沒有足夠的數據來完成任何一次滾動回測。")
             return
@@ -255,7 +242,6 @@ class MLOptimizerAndBacktester:
         total_trades = sum(r['total_trades'] for r in fold_results)
         won_trades = sum(r['won_trades'] for r in fold_results)
         win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
-        # 注意: max_drawdown 和 sharpe_ratio 的彙總是複雜的，這裡只取平均值作為參考
         avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
         avg_sharpe_ratio = np.mean([r['sharpe_ratio'] for r in fold_results])
         
@@ -271,9 +257,8 @@ class MLOptimizerAndBacktester:
             "final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate
         }
 
-
     def run(self):
-        print(f"========= 整合式滾動優化與回測流程開始 (版本 5.0) =========")
+        print(f"========= 整合式滾動優化與回測流程開始 (版本 5.1) =========")
         input_dir = Path(self.paths['features_data'])
         input_files = list(input_dir.rglob("*.parquet"))
         
@@ -285,9 +270,11 @@ class MLOptimizerAndBacktester:
             try:
                 self.run_for_single_market(market_file)
             except Exception as e:
+                # 為了更好地除錯，打印出完整的錯誤訊息
                 print(f"錯誤: 處理市場 {market_file.name} 時發生未預期的錯誤: {e}")
+                import traceback
+                traceback.print_exc()
 
-        # 最後打印所有市場的簡易總結
         print("\n" + "="*25 + " 所有市場滾動回測最終總結 " + "="*25)
         if self.all_market_results:
             summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index')
@@ -306,4 +293,6 @@ if __name__ == "__main__":
         optimizer.run()
     except Exception as e:
         print(f"腳本執行時發生未預期的嚴重錯誤: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
