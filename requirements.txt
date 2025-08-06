@@ -1,4 +1,6 @@
 # 專為 Google Colab 雲端環境
+#讀取設定檔
+PyYAML
 # 基礎數據處理
 pandas
 pyarrow
