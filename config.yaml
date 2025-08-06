@@ -52,7 +52,7 @@ walk_forward_optimization:
 # --- 交易策略參數 (用於 04_parameter_optimization.py) ---
 strategy_params:
   # 模型預測的進場機率閾值
-  entry_prob_threshold: 0.60 # ★★★ 提高進場門檻，尋找更高勝算的機會 ★★★
+  entry_threshold: 0.60 # ★★★ 提高進場門檻，尋找更高勝算的機會 ★★★
   
   # ATR 風險管理設定
   atr_period: 14
