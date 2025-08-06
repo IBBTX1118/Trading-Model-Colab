@@ -56,5 +56,5 @@ strategy_params:
   
   # ATR 風險管理設定
   atr_period: 14
-  atr_stop_loss_multiplier: 2.0  # 停損設置在 2 倍 ATR 之外
-  atr_take_profit_multiplier: 3.0 # 停利設置在 3 倍 ATR 之外
+  atr_sl_multiplier:  2.0  # 停損設置在 2 倍 ATR 之外
+  atr_tp_multiplier:  3.0 # 停利設置在 3 倍 ATR 之外
