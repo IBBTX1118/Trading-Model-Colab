@@ -67,6 +67,9 @@ class FinalMLStrategy(bt.Strategy):
         if pred_prob > self.p.entry_threshold:
             current_price = self.data.close[0]
             current_atr = self.atr[0]
+            
+            # ★★★ 新增保護機制：確保 ATR 是有效的正數才下單 ★★★
+            if current_atr > 0:
 
             # 計算停損價與停利價
             sl_price = current_price - self.p.atr_sl_multiplier * current_atr
