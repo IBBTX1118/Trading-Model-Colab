@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 整合滾動優化 (Walk-Forward Optimization)、ATR 風險管理與超參數調整的完整流程。
-# 版本: 5.1 (穩定版)
+# 版本: 5.2 (最終修正版 - 處理所有邊界情況)
 
 import sys
 import yaml
@@ -10,6 +10,7 @@ from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
 from datetime import timedelta
+import traceback
 
 import backtrader as bt
 import lightgbm as lgb
@@ -51,31 +52,23 @@ class FinalMLStrategy(bt.Strategy):
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
 
     def next(self):
-        # ★★★ 修正點：只檢查 self.position，語法最簡潔且正確 ★★★
-        # 如果已在場內，則不執行任何新操作
         if self.position:
             return
 
         try:
-            # 獲取當前 K 棒的特徵向量
             feature_vector = np.array([line[0] for line in self.feature_lines]).reshape(1, -1)
         except IndexError:
-            return # 數據不足，無法計算特徵
+            return
 
-        # 預測進場機率
         pred_prob = self.p.model.predict_proba(feature_vector)[0][1]
 
         if pred_prob > self.p.entry_threshold:
             current_price = self.data.close[0]
             current_atr = self.atr[0]
-
-            # ★★★ 修正點：新增保護機制，確保 ATR 是有效的正數才下單 ★★★
+            
             if current_atr > 0:
-                # 計算停損價與停利價
                 sl_price = current_price - self.p.atr_sl_multiplier * current_atr
                 tp_price = current_price + self.p.atr_tp_multiplier * current_atr
-                
-                # 使用 buy_bracket 送出帶有停損停利的掛單
                 self.buy_bracket(
                     price=current_price,
                     stopprice=sl_price,
@@ -129,7 +122,7 @@ class MLOptimizerAndBacktester:
         return roc_auc_score(y_val.values, pred_probs)
 
     def run_backtest_on_fold(self, df_test: pd.DataFrame, model: lgb.LGBMClassifier) -> Dict:
-        """在單一滾動窗口的測試集上執行回測（★★ 版本更新：更穩健的結果提取 ★★）"""
+        """在單一滾動窗口的測試集上執行回測"""
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(self.selected_features)
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in self.selected_features])
@@ -158,122 +151,116 @@ class MLOptimizerAndBacktester:
         drawdown_analysis = analysis.drawdown.get_analysis()
         sharpe_analysis = analysis.sharpe.get_analysis()
         
-        # ★★★ 核心修正點：先判斷是否有交易，再提取結果 ★★★
         if trades_analysis.total.total > 0:
-            # 如果有交易，正常提取數據
+            sharpe_ratio = sharpe_analysis.get('sharperatio')
             return {
                 "pnl": trades_analysis.pnl.net.total,
                 "total_trades": trades_analysis.total.total,
                 "won_trades": trades_analysis.won.total,
                 "lost_trades": trades_analysis.lost.total,
                 "max_drawdown": drawdown_analysis.max.drawdown,
-                "sharpe_ratio": sharpe_analysis.get('sharperatio', 0.0)
+                "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
             }
         else:
-            # 如果沒有交易，返回預設的 0 值
             return {
-                "pnl": 0.0,
-                "total_trades": 0,
-                "won_trades": 0,
-                "lost_trades": 0,
-                "max_drawdown": 0.0,
-                "sharpe_ratio": 0.0
+                "pnl": 0.0, "total_trades": 0, "won_trades": 0,
+                "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0
             }
 
     def run_for_single_market(self, market_file_path: Path):
-    market_name = market_file_path.stem
-    print(f"\n{'='*25} 開始處理市場: {market_name} {'='*25}")
-    
-    df = pd.read_parquet(market_file_path)
-    df.index = pd.to_datetime(df.index)
-
-    label_config = self.config['feature_selection']
-    future_returns = df['close'].shift(-label_config['label_look_forward_periods']) / df['close'] - 1
-    df['target'] = (future_returns > label_config['label_return_threshold']).astype(int)
-    
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
-    
-    if df.empty:
-        print(f"警告: 市場 {market_name} 在數據清洗後為空，已跳過。")
-        return
-
-    start_date = df.index.min()
-    end_date = df.index.max()
-    
-    train_days = timedelta(days=self.wfo_config['training_days'])
-    val_days = timedelta(days=self.wfo_config['validation_days'])
-    test_days = timedelta(days=self.wfo_config['testing_days'])
-    step_days = timedelta(days=self.wfo_config['step_days'])
-
-    current_date = start_date
-    fold_results = []
-    fold_number = 0
-
-    while current_date + train_days + val_days + test_days <= end_date:
-        fold_number += 1
-        train_start = current_date
-        val_start = train_start + train_days
-        test_start = val_start + val_days
-        test_end = test_start + test_days
+        market_name = market_file_path.stem
+        print(f"\n{'='*25} 開始處理市場: {market_name} {'='*25}")
         
-        print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
+        df = pd.read_parquet(market_file_path)
+        df.index = pd.to_datetime(df.index)
 
-        df_train = df[train_start:val_start]
-        df_val = df[val_start:test_start]
-        df_test = df[test_start:test_end]
+        label_config = self.config['feature_selection']
+        future_returns = df['close'].shift(-label_config['label_look_forward_periods']) / df['close'] - 1
+        df['target'] = (future_returns > label_config['label_return_threshold']).astype(int)
+        
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.dropna(inplace=True)
+        
+        if df.empty:
+            print(f"警告: 市場 {market_name} 在數據清洗後為空，已跳過。")
+            return
 
-        if df_train.empty or df_val.empty or df_test.empty:
-            print("警告: 當前窗口數據不足，跳過此 Fold。")
+        start_date = df.index.min()
+        end_date = df.index.max()
+        
+        train_days = timedelta(days=self.wfo_config['training_days'])
+        val_days = timedelta(days=self.wfo_config['validation_days'])
+        test_days = timedelta(days=self.wfo_config['testing_days'])
+        step_days = timedelta(days=self.wfo_config['step_days'])
+
+        current_date = start_date
+        fold_results = []
+        fold_number = 0
+
+        while current_date + train_days + val_days + test_days <= end_date:
+            fold_number += 1
+            train_start = current_date
+            val_start = train_start + train_days
+            test_start = val_start + val_days
+            test_end = test_start + test_days
+            
+            print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
+
+            df_train = df[train_start:val_start]
+            df_val = df[val_start:test_start]
+            df_test = df[test_start:test_end]
+
+            if df_train.empty or df_val.empty or df_test.empty:
+                print("警告: 當前窗口數據不足，跳過此 Fold。")
+                current_date += step_days
+                continue
+
+            X_train, y_train = df_train[self.selected_features], df_train['target']
+            X_val, y_val = df_val[self.selected_features], df_val['target']
+
+            study = optuna.create_study(direction='maximize')
+            study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), 
+                           n_trials=self.wfo_config['n_trials'], show_progress_bar=False)
+            
+            X_in_sample = pd.concat([X_train, X_val])
+            y_in_sample = pd.concat([y_train, y_val])
+            final_model = lgb.LGBMClassifier(**study.best_params)
+            final_model.fit(X_in_sample.values, y_in_sample.values)
+            
+            result = self.run_backtest_on_fold(df_test, final_model)
+            fold_results.append(result)
+            print(f"Fold {fold_number} 結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={(result['won_trades']/result['total_trades']*100 if result['total_trades']>0 else 0):.2f}%")
+            
             current_date += step_days
-            continue
 
-        X_train, y_train = df_train[self.selected_features], df_train['target']
-        X_val, y_val = df_val[self.selected_features], df_val['target']
-
-        study = optuna.create_study(direction='maximize')
-        study.optimize(lambda trial: self.objective(trial, X_train, y_train, X_val, y_val), 
-                       n_trials=self.wfo_config['n_trials'], show_progress_bar=False)
-        
-        X_in_sample = pd.concat([X_train, X_val])
-        y_in_sample = pd.concat([y_train, y_val])
-        final_model = lgb.LGBMClassifier(**study.best_params)
-        final_model.fit(X_in_sample.values, y_in_sample.values)
-        
-        result = self.run_backtest_on_fold(df_test, final_model)
-        fold_results.append(result)
-        print(f"Fold {fold_number} 結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={(result['won_trades']/result['total_trades']*100 if result['total_trades']>0 else 0):.2f}%")
-        
-        current_date += step_days
-
-    if not fold_results:
-        print(f"\n市場 {market_name} 沒有足夠的數據來完成任何一次滾動回測。")
-        return
-        
-    final_pnl = sum(r['pnl'] for r in fold_results)
-    total_trades = sum(r['total_trades'] for r in fold_results)
-    won_trades = sum(r['won_trades'] for r in fold_results)
-    win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
-    avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
     
-    # ★★★ 核心修正點：計算平均值前，過濾掉可能的 None 值 ★★★
-    valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r['sharpe_ratio'] is not None]
-    avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
-    
-    print("\n" + f"--- {market_name} 滾動優化總結報告 ---")
-    print(f"  - 總淨利: {final_pnl:,.2f}")
-    print(f"  - 總交易次數: {total_trades}")
-    print(f"  - 總勝率: {win_rate:.2%}")
-    print(f"  - 平均最大回撤: {avg_max_drawdown:.2f}%")
-    print(f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}")
-    print("-" * 50)
-    
-    self.all_market_results[market_name] = {
-        "final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate
-    }
+        if not fold_results:
+            print(f"\n市場 {market_name} 沒有足夠的數據來完成任何一次滾動回測。")
+            return
+            
+        final_pnl = sum(r['pnl'] for r in fold_results)
+        total_trades = sum(r['total_trades'] for r in fold_results)
+        won_trades = sum(r['won_trades'] for r in fold_results)
+        win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
+        avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
+        
+        valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r['sharpe_ratio'] is not None]
+        avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
+        
+        print("\n" + f"--- {market_name} 滾動優化總結報告 ---")
+        print(f"  - 總淨利: {final_pnl:,.2f}")
+        print(f"  - 總交易次數: {total_trades}")
+        print(f"  - 總勝率: {win_rate:.2%}")
+        print(f"  - 平均最大回撤: {avg_max_drawdown:.2f}%")
+        print(f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}")
+        print("-" * 50)
+        
+        self.all_market_results[market_name] = {
+            "final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate
+        }
 
     def run(self):
-        print(f"========= 整合式滾動優化與回測流程開始 (版本 5.1) =========")
+        print(f"========= 整合式滾動優化與回測流程開始 (版本 5.2) =========")
         input_dir = Path(self.paths['features_data'])
         input_files = list(input_dir.rglob("*.parquet"))
         
@@ -285,9 +272,7 @@ class MLOptimizerAndBacktester:
             try:
                 self.run_for_single_market(market_file)
             except Exception as e:
-                # 為了更好地除錯，打印出完整的錯誤訊息
-                print(f"錯誤: 處理市場 {market_file.name} 時發生未預期的錯誤: {e}")
-                import traceback
+                print(f"錯誤: 處理市場 {market_file.name} 時發生未預期的錯誤:")
                 traceback.print_exc()
 
         print("\n" + "="*25 + " 所有市場滾動回測最終總結 " + "="*25)
@@ -307,7 +292,6 @@ if __name__ == "__main__":
         optimizer = MLOptimizerAndBacktester(config)
         optimizer.run()
     except Exception as e:
-        print(f"腳本執行時發生未預期的嚴重錯誤: {e}")
-        import traceback
+        print(f"腳本執行時發生未預期的嚴重錯誤:")
         traceback.print_exc()
         sys.exit(1)
