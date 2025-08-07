@@ -1,27 +1,20 @@
 # ==============================================================================
-# 全域設定檔 for 量化交易模型 v4.2
+# 全域設定檔 for 量化交易模型 v5.0 (Phase 2)
 # ==============================================================================
 
 # --- 路徑設定 ---
 paths:
-  # 01_data_acquisition 的輸出目錄
   raw_data: "Output_Data_Pipeline_v2/MarketData"
-  # 02_feature_engineering 的輸出目錄
   features_data: "Output_Feature_Engineering/MarketData_with_Deep_Features_v2"
-  # 03, 04 的輸出目錄
   ml_pipeline_output: "Output_ML_Pipeline"
-  # 篩選後特徵的存檔名稱
   selected_features_filename: "selected_features.json"
 
 # --- 標籤與特徵篩選設定 (用於 03_feature_selection.py) ---
+# ★★★ Phase 2 中，04 腳本將不再使用此區塊的標籤設定 ★★★
 feature_selection:
-  # 預測未來 K 棒數量
   label_look_forward_periods: 12
-  # 目標報酬率閾值
   label_return_threshold: 0.003
-  # 要選擇最重要的 N 個特徵
   top_n_features: 20
-  # LightGBM 模型參數 (用於特徵篩選)
   lgbm_params:
     objective: 'binary'
     metric: 'binary_logloss'
@@ -31,30 +24,28 @@ feature_selection:
     num_leaves: 31
     max_depth: -1
     seed: 42
-    n_jobs: -1
+    n_jobs': -1
     verbose: -1
+
+# --- ★★★ 新增：三道門檻標籤法設定 (用於 04_parameter_optimization.py) ★★★ ---
+triple_barrier_settings:
+  tp_pct: 0.015  # 停利目標：上漲 1.5%
+  sl_pct: 0.01   # 停損目標：下跌 1.0%
+  max_hold_periods: 20 # 最長持倉 K 棒數
 
 # --- 滾動優化與回測設定 (用於 04_parameter_optimization.py) ---
 walk_forward_optimization:
-  # Optuna 超參數優化
-  n_trials: 50 # ★★★ 為了加速，可先設為 50，之後再調回 100 ★★★
-
-  # 滾動窗口設定 (單位: 天)
-  training_days: 540   # 約 1.5 年的訓練數據
-  validation_days: 180 # 約 0.5 年的驗證數據
-  testing_days: 90     # 每次滾動後，在未來 3 個月進行樣本外測試
-  step_days: 90        # 每次滾動的步長 (與 testing_days 相同)
-
-  # Backtrader 回測設定
+  n_trials: 50
+  training_days: 540
+  validation_days: 180
+  testing_days: 90
+  step_days: 90
   initial_cash: 100000.0
   commission: 0.001
 
 # --- 交易策略參數 (用於 04_parameter_optimization.py) ---
 strategy_params:
-  # 模型預測的進場機率閾值
-  entry_threshold: 0.60 # ★★★ 提高進場門檻，尋找更高勝算的機會 ★★★
-  
-  # ATR 風險管理設定
+  entry_threshold: 0.55 # ★★★ 由於模型目標改變，可適當調回 0.55 觀察 ★★★
   atr_period: 14
-  atr_sl_multiplier:  2.0  # 停損設置在 2 倍 ATR 之外
-  atr_tp_multiplier:  3.0 # 停利設置在 3 倍 ATR 之外
+  atr_sl_multiplier: 2.0
+  atr_tp_multiplier: 3.0
