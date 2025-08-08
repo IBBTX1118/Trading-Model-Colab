@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: Phase 2 實作：整合三道門檻標籤法與夏普比率優化。
-# 版本: 6.1 (動態特徵修正版)
+# 版本: 6.2 (最終穩定版)
 
 import sys
 import yaml
@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 from datetime import timedelta
 import traceback
-import logging # 引入日誌模組
+import logging
 
 import backtrader as bt
 import lightgbm as lgb
@@ -33,9 +33,10 @@ def load_config(config_path: str = 'config.yaml') -> Dict:
         sys.exit(1)
 
 # ==============================================================================
-# 2. 三道門檻標籤法實作
+# 2. 三道門檻標籤法實作 (修正版)
 # ==============================================================================
 def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
+    """為數據集創建三道門檻標籤 (★★ 版本更新：修正索引 bug ★★)"""
     df_out = df.copy()
     tp_pct = settings['tp_pct']
     sl_pct = settings['sl_pct']
@@ -43,41 +44,37 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     
     outcomes = pd.DataFrame(index=df_out.index, columns=['hit_time', 'label'])
     
-    close_prices = df_out['close']
-    high_prices = df_out['high']
-    low_prices = df_out['low']
-    
     for i in range(len(df_out) - max_hold):
-        entry_price = close_prices.iloc[i]
+        entry_price = df_out['close'].iloc[i]
         tp_price = entry_price * (1 + tp_pct)
         sl_price = entry_price * (1 - sl_pct)
         
         window = df_out.iloc[i+1 : i+1+max_hold]
         
-        hit_tp_time = window[high_prices.iloc[i+1:i+1+max_hold] >= tp_price].index.min()
-        hit_sl_time = window[low_prices.iloc[i+1:i+1+max_hold] <= sl_price].index.min()
+        # ★★★ 核心修正：直接使用 window 內的欄位，避免索引錯位 ★★★
+        hit_tp_time = window[window['high'] >= tp_price].index.min()
+        hit_sl_time = window[window['low'] <= sl_price].index.min()
         
         if pd.notna(hit_tp_time) and pd.notna(hit_sl_time):
             if hit_tp_time < hit_sl_time:
-                outcomes.iloc[i, outcomes.columns.get_loc('label')] = 1
-                outcomes.iloc[i, outcomes.columns.get_loc('hit_time')] = hit_tp_time
+                outcomes.loc[df_out.index[i], 'label'] = 1
+                outcomes.loc[df_out.index[i], 'hit_time'] = hit_tp_time
             else:
-                outcomes.iloc[i, outcomes.columns.get_loc('label')] = -1
-                outcomes.iloc[i, outcomes.columns.get_loc('hit_time')] = hit_sl_time
+                outcomes.loc[df_out.index[i], 'label'] = -1
+                outcomes.loc[df_out.index[i], 'hit_time'] = hit_sl_time
         elif pd.notna(hit_tp_time):
-            outcomes.iloc[i, outcomes.columns.get_loc('label')] = 1
-            outcomes.iloc[i, outcomes.columns.get_loc('hit_time')] = hit_tp_time
+            outcomes.loc[df_out.index[i], 'label'] = 1
+            outcomes.loc[df_out.index[i], 'hit_time'] = hit_tp_time
         elif pd.notna(hit_sl_time):
-            outcomes.iloc[i, outcomes.columns.get_loc('label')] = -1
-            outcomes.iloc[i, outcomes.columns.get_loc('hit_time')] = hit_sl_time
+            outcomes.loc[df_out.index[i], 'label'] = -1
+            outcomes.loc[df_out.index[i], 'hit_time'] = hit_sl_time
         else:
-            outcomes.iloc[i, outcomes.columns.get_loc('label')] = 0
-            outcomes.iloc[i, outcomes.columns.get_loc('hit_time')] = window.index[-1]
+            outcomes.loc[df_out.index[i], 'label'] = 0
+            outcomes.loc[df_out.index[i], 'hit_time'] = window.index[-1]
             
     df_out = df_out.join(outcomes)
     df_out['target'] = (df_out['label'] == 1).astype(int)
     return df_out
-
 # ==============================================================================
 # 3. Backtrader 策略
 # ==============================================================================
@@ -104,32 +101,20 @@ class FinalMLStrategy(bt.Strategy):
 # ==============================================================================
 class MLOptimizerAndBacktester:
     def __init__(self, config: Dict):
-        # ★★★ 核心修正：將日誌初始化程式碼移到最前面 ★★★
         self.logger = logging.getLogger(self.__class__.__name__)
         if not self.logger.hasHandlers():
-            handler = logging.StreamHandler(sys.stdout)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
+            handler = logging.StreamHandler(sys.stdout); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter); self.logger.addHandler(handler); self.logger.setLevel(logging.INFO)
             
-        self.config = config
-        self.paths = config['paths']
-        self.wfo_config = config['walk_forward_optimization']
-        self.strategy_params = config['strategy_params']
-        self.tb_settings = config['triple_barrier_settings']
-        
-        self.output_base_dir = Path(self.paths['ml_pipeline_output'])
-        self.output_base_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.config = config; self.paths = config['paths']; self.wfo_config = config['walk_forward_optimization']
+        self.strategy_params = config['strategy_params']; self.tb_settings = config['triple_barrier_settings']
+        self.output_base_dir = Path(self.paths['ml_pipeline_output']); self.output_base_dir.mkdir(parents=True, exist_ok=True)
         features_file = self.output_base_dir / self.paths['selected_features_filename']
         self.selected_features = self._load_json(features_file)['selected_features']
-        
-        self.all_market_results = {}
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        self.all_market_results = {}; optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path) -> Dict:
-        if not file_path.exists(): print(f"致命錯誤: 輸入檔案 {file_path} 不存在！"); sys.exit(1)
+        if not file_path.exists(): self.logger.error(f"致命錯誤: 輸入檔案 {file_path} 不存在！"); sys.exit(1)
         with open(file_path, 'r') as f: data = json.load(f)
         self.logger.info(f"成功從 {file_path} 載入 {len(data['selected_features'])} 個全域特徵。")
         return data
@@ -162,25 +147,16 @@ class MLOptimizerAndBacktester:
             return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0}
 
     def run_for_single_market(self, market_file_path: Path):
-        market_name = market_file_path.stem
-        self.logger.info(f"{'='*25} 開始處理市場: {market_name} {'='*25}")
-        
-        df = pd.read_parquet(market_file_path)
-        df.index = pd.to_datetime(df.index)
+        self.logger.info(f"{'='*25} 開始處理市場: {market_file_path.stem} {'='*25}")
+        df = pd.read_parquet(market_file_path); df.index = pd.to_datetime(df.index)
 
-        # ★★★ 核心修正 #1：只選取當前 DataFrame 中存在的特徵子集 ★★★
         available_features = [f for f in self.selected_features if f in df.columns]
-        self.logger.info(f"在 {market_name} 中找到 {len(available_features)}/{len(self.selected_features)} 個可用特徵。")
+        self.logger.info(f"在 {market_file_path.stem} 中找到 {len(available_features)}/{len(self.selected_features)} 個可用特徵。")
         if len(available_features) < 5:
-            self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_name}。")
-            return
+            self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_file_path.stem}。"); return
 
-        df = create_triple_barrier_labels(df, self.tb_settings)
-        df.dropna(inplace=True)
-        
-        if df.empty:
-            self.logger.warning(f"市場 {market_name} 在數據清洗後為空，已跳過。")
-            return
+        df = create_triple_barrier_labels(df, self.tb_settings); df.dropna(inplace=True)
+        if df.empty: self.logger.warning(f"市場 {market_file_path.stem} 在數據清洗後為空，已跳過。"); return
             
         start_date, end_date = df.index.min(), df.index.max()
         train_days, val_days = timedelta(days=self.wfo_config['training_days']), timedelta(days=self.wfo_config['validation_days'])
@@ -195,12 +171,11 @@ class MLOptimizerAndBacktester:
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
 
             df_train, df_val, df_test = df[train_start:val_start], df[val_start:test_start], df[test_start:test_end]
-            if any(df.empty for df in [df_train, df_val, df_test]):
+            if any(d.empty for d in [df_train, df_val, df_test]):
                 self.logger.warning("當前窗口數據不足，跳過此 Fold。"); current_date += step_days; continue
 
             X_train, y_train = df_train[available_features], df_train['target']
             
-            # ★★★ 核心修正 #2：將 available_features 傳入優化流程 ★★★
             study = optuna.create_study(direction='maximize')
             study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, available_features), 
                            n_trials=self.wfo_config['n_trials'], show_progress_bar=True)
@@ -210,26 +185,24 @@ class MLOptimizerAndBacktester:
             y_in_sample = pd.concat([df_train['target'], df_val['target']])
             final_model = lgb.LGBMClassifier(**study.best_params); final_model.fit(X_in_sample.values, y_in_sample.values)
             
-            # ★★★ 核心修正 #3：將 available_features 傳入回測流程 ★★★
             result = self.run_backtest_on_fold(df_test, final_model, available_features)
             fold_results.append(result)
             print(f"Fold {fold_number} 測試結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={(result['won_trades']/result['total_trades']*100 if result['total_trades']>0 else 0):.2f}%")
             
             current_date += step_days
     
-        if not fold_results:
-            self.logger.warning(f"市場 {market_name} 沒有足夠的數據來完成任何一次滾動回測。"); return
+        if not fold_results: self.logger.warning(f"市場 {market_file_path.stem} 沒有足夠數據完成滾動回測。"); return
             
         final_pnl = sum(r['pnl'] for r in fold_results); total_trades = sum(r['total_trades'] for r in fold_results)
         won_trades = sum(r['won_trades'] for r in fold_results); win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
         avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
         valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r['sharpe_ratio'] is not None]; avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
         
-        print("\n" + f"--- {market_name} 滾動優化總結報告 ---"); print(f"  - 總淨利: {final_pnl:,.2f}"); print(f"  - 總交易次數: {total_trades}"); print(f"  - 總勝率: {win_rate:.2%}"); print(f"  - 平均最大回撤: {avg_max_drawdown:.2f}%"); print(f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}"); print("-" * 50)
-        self.all_market_results[market_name] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate}
+        print("\n" + f"--- {market_file_path.stem} 滾動優化總結報告 ---"); print(f"  - 總淨利: {final_pnl:,.2f}"); print(f"  - 總交易次數: {total_trades}"); print(f"  - 總勝率: {win_rate:.2%}"); print(f"  - 平均最大回撤: {avg_max_drawdown:.2f}%"); print(f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}"); print("-" * 50)
+        self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate}
 
     def run(self):
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 6.1) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 6.2) {'='*25}")
         input_dir = Path(self.paths['features_data']); input_files = list(input_dir.rglob("*.parquet"))
         if not input_files: self.logger.error(f"在 {input_dir} 中找不到任何數據檔案！"); return
         
