@@ -231,7 +231,7 @@ class MLOptimizerAndBacktester:
 
     def run(self):
         # ... (此函式內容不變，為節省空間省略)
-        print(f"========= 整合式滾動優化與回測流程開始 (版本 6.0) ========="); input_dir = Path(self.paths['features_data']); input_files = list(input_dir.rglob("*.parquet"))
+        print(f"========= 整合式滾動優化與回測流程開始 (版本 6.0) ========="); input_dir = Path(self.paths['features_data']); input_files = list(input_dir.rglob("*_D1.parquet"))
         if not input_files: print(f"致命錯誤: 在 {input_dir} 中找不到任何數據檔案！"); return
         for market_file in sorted(input_files):
             try: self.run_for_single_market(market_file)
