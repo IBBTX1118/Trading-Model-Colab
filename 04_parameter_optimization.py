@@ -104,12 +104,7 @@ class FinalMLStrategy(bt.Strategy):
 # ==============================================================================
 class MLOptimizerAndBacktester:
     def __init__(self, config: Dict):
-        self.config = config; self.paths = config['paths']; self.wfo_config = config['walk_forward_optimization']
-        self.strategy_params = config['strategy_params']; self.tb_settings = config['triple_barrier_settings']
-        self.output_base_dir = Path(self.paths['ml_pipeline_output']); self.output_base_dir.mkdir(parents=True, exist_ok=True)
-        features_file = self.output_base_dir / self.paths['selected_features_filename']
-        self.selected_features = self._load_json(features_file)['selected_features']
-        self.all_market_results = {}; optuna.logging.set_verbosity(optuna.logging.WARNING)
+        # ★★★ 核心修正：將日誌初始化程式碼移到最前面 ★★★
         self.logger = logging.getLogger(self.__class__.__name__)
         if not self.logger.hasHandlers():
             handler = logging.StreamHandler(sys.stdout)
@@ -117,6 +112,21 @@ class MLOptimizerAndBacktester:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+            
+        self.config = config
+        self.paths = config['paths']
+        self.wfo_config = config['walk_forward_optimization']
+        self.strategy_params = config['strategy_params']
+        self.tb_settings = config['triple_barrier_settings']
+        
+        self.output_base_dir = Path(self.paths['ml_pipeline_output'])
+        self.output_base_dir.mkdir(parents=True, exist_ok=True)
+        
+        features_file = self.output_base_dir / self.paths['selected_features_filename']
+        self.selected_features = self._load_json(features_file)['selected_features']
+        
+        self.all_market_results = {}
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path) -> Dict:
         if not file_path.exists(): print(f"致命錯誤: 輸入檔案 {file_path} 不存在！"); sys.exit(1)
