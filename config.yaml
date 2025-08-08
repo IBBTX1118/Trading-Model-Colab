@@ -5,7 +5,7 @@
 # --- 路徑設定 ---
 paths:
   raw_data: "Output_Data_Pipeline_v2/MarketData"
-  features_data: "Output_Feature_Engineering/MarketData_with_Deep_Features_v2"
+  features_data: "Output_Feature_Engineering/MarketData_with_Combined_Features_v3"
   ml_pipeline_output: "Output_ML_Pipeline"
   selected_features_filename: "selected_features.json"
 
