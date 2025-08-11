@@ -6,7 +6,7 @@ import sys
 import yaml
 import json
 from pathlib import Path
-# ... 其他 import 維持不變 ...
+from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
 from datetime import timedelta
@@ -15,10 +15,6 @@ import logging
 import backtrader as bt
 import lightgbm as lgb
 import optuna
-
-# (load_config 和 create_triple_barrier_labels 函式維持不變)
-# ...
-
 # ==============================================================================
 # ★★★ 全面升級的交易策略 ★★★
 # ==============================================================================
