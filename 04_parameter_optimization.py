@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: Phase 2.1 實作：升級為多分類模型，統一出口，實現多空交易。
-# 版本: 7.0 (多分類模型 + 統一出口)
+# 版本: 7.1 (整合完整版)
 
 import sys
 import yaml
@@ -12,11 +12,68 @@ import numpy as np
 from datetime import timedelta
 import traceback
 import logging
+
 import backtrader as bt
 import lightgbm as lgb
 import optuna
+
 # ==============================================================================
-# ★★★ 全面升級的交易策略 ★★★
+#                      輔助函式 (請確保它們存在)
+# ==============================================================================
+
+def load_config(config_path: str = 'config.yaml') -> Dict:
+    """載入 YAML 設定檔"""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"致命錯誤: 設定檔 {config_path} 不存在！")
+        sys.exit(1)
+    except Exception as e:
+        print(f"致命錯誤: 讀取設定檔 {config_path} 時發生錯誤: {e}")
+        sys.exit(1)
+
+def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
+    """為 DataFrame 創建三道門檻標籤。"""
+    df_out = df.copy()
+    tp_pct = settings['tp_pct']
+    sl_pct = settings['sl_pct']
+    max_hold = settings['max_hold_periods']
+    
+    outcomes = pd.DataFrame(index=df_out.index, columns=['hit_time', 'label'])
+    
+    for i in range(len(df_out) - max_hold):
+        entry_price = df_out['close'].iloc[i]
+        tp_price = entry_price * (1 + tp_pct)
+        sl_price = entry_price * (1 - sl_pct)
+        
+        window = df_out.iloc[i+1 : i+1+max_hold]
+        
+        hit_tp_time = window[window['high'] >= tp_price].index.min()
+        hit_sl_time = window[window['low'] <= sl_price].index.min()
+        
+        if pd.notna(hit_tp_time) and pd.notna(hit_sl_time):
+            if hit_tp_time < hit_sl_time:
+                outcomes.loc[df_out.index[i], 'label'] = 1
+                outcomes.loc[df_out.index[i], 'hit_time'] = hit_tp_time
+            else:
+                outcomes.loc[df_out.index[i], 'label'] = -1
+                outcomes.loc[df_out.index[i], 'hit_time'] = hit_sl_time
+        elif pd.notna(hit_tp_time):
+            outcomes.loc[df_out.index[i], 'label'] = 1
+            outcomes.loc[df_out.index[i], 'hit_time'] = hit_tp_time
+        elif pd.notna(hit_sl_time):
+            outcomes.loc[df_out.index[i], 'label'] = -1
+            outcomes.loc[df_out.index[i], 'hit_time'] = hit_sl_time
+        else:
+            outcomes.loc[df_out.index[i], 'label'] = 0
+            outcomes.loc[df_out.index[i], 'hit_time'] = window.index[-1]
+            
+    df_out = df_out.join(outcomes)
+    return df_out
+
+# ==============================================================================
+#                      全面升級的交易策略
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
@@ -30,33 +87,26 @@ class FinalMLStrategy(bt.Strategy):
     def __init__(self):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
-        # 將特徵從數據流中提取出來
         self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
-        # 記錄日誌
-        self.log(f"策略初始化完成。Entry Threshold: {self.p.entry_threshold}, TP: {self.p.tp_pct:.2%}, SL: {self.p.sl_pct:.2%}")
+        # self.log(f"策略初始化完成。Entry Threshold: {self.p.entry_threshold}, TP: {self.p.tp_pct:.2%}, SL: {self.p.sl_pct:.2%}")
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
-        print(f'{dt.isoformat()} - {txt}')
+        # print(f'{dt.isoformat()} - {txt}') # 可選擇開啟詳細日誌
 
     def next(self):
-        # 如果已經有倉位，則不執行任何操作
         if self.position:
             return
 
         try:
-            # 準備當前 K 棒的特徵向量
             feature_vector = np.array([line[0] for line in self.feature_lines]).reshape(1, -1)
         except IndexError:
-            # 數據還未就緒
             return
             
-        # 使用多分類模型預測機率
-        # 預期輸出 shape: (1, 3)，順序為 [P(SL), P(TP), P(Timeout)]
         pred_probs = self.p.model.predict_proba(feature_vector)[0]
         
-        prob_sl = pred_probs[0]  # 觸及停損的機率
-        prob_tp = pred_probs[1]  # 觸及停利的機率
+        prob_sl = pred_probs[0]  # Class 0: 觸及停損的機率
+        prob_tp = pred_probs[1]  # Class 1: 觸及停利的機率
         
         current_price = self.data.close[0]
 
@@ -83,20 +133,18 @@ class FinalMLStrategy(bt.Strategy):
             self.log(f"建立賣單 @ {current_price:.5f}, TP @ {tp_price:.5f}, SL @ {sl_price:.5f}")
 
 # ==============================================================================
-# ★★★ 優化器與回測器 (修改版) ★★★
+#                      優化器與回測器 (修改版)
 # ==============================================================================
 class MLOptimizerAndBacktester:
     def __init__(self, config: Dict):
-        # ... 初始化前半部分不變 ...
         self.config = config
         self.paths = config['paths']
         self.wfo_config = config['walk_forward_optimization']
-        # ★★★ 策略參數現在直接從三道門檻設定中讀取一部分 ★★★
         self.strategy_params = config['strategy_params']
         self.tb_settings = config['triple_barrier_settings']
         self.strategy_params['tp_pct'] = self.tb_settings['tp_pct']
         self.strategy_params['sl_pct'] = self.tb_settings['sl_pct']
-        # ... 後半部分不變 ...
+        
         self.logger = logging.getLogger(self.__class__.__name__)
         if not self.logger.hasHandlers():
             handler = logging.StreamHandler(sys.stdout)
@@ -104,6 +152,7 @@ class MLOptimizerAndBacktester:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+
         self.output_base_dir = Path(self.paths['ml_pipeline_output'])
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
         features_file = self.output_base_dir / self.paths['selected_features_filename']
@@ -112,19 +161,20 @@ class MLOptimizerAndBacktester:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path) -> Dict:
-        # ... 此函式不變 ...
-        if not file_path.exists(): self.logger.error(f"致命錯誤: 輸入檔案 {file_path} 不存在！"); sys.exit(1)
-        with open(file_path, 'r') as f: data = json.load(f)
+        if not file_path.exists():
+            self.logger.error(f"致命錯誤: 輸入檔案 {file_path} 不存在！")
+            sys.exit(1)
+        with open(file_path, 'r') as f:
+            data = json.load(f)
         self.logger.info(f"成功從 {file_path} 載入 {len(data['selected_features'])} 個全域特徵。")
         return data
 
-    # ★★★ 核心修正 #1：修改 objective 函式以支持多分類 ★★★
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, df_val, available_features: list) -> float:
         """Optuna 的目標函數，優化驗證集上的夏普比率 (多分類版)"""
         param = {
-            'objective': 'multiclass',    # <--- 修改
-            'metric': 'multi_logloss',    # <--- 修改
-            'num_class': 3,               # <--- 新增
+            'objective': 'multiclass',
+            'metric': 'multi_logloss',
+            'num_class': 3,
             'verbosity': -1,
             'boosting_type': 'gbdt',
             'n_estimators': trial.suggest_int('n_estimators', 100, 800),
@@ -148,7 +198,6 @@ class MLOptimizerAndBacktester:
         return sharpe
 
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list) -> Dict:
-        # ★★★ 此函式只需修改傳遞給策略的參數 ★★★
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(available_features)
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in available_features])
@@ -156,18 +205,16 @@ class MLOptimizerAndBacktester:
         cerebro = bt.Cerebro(stdstats=False)
         cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
         
-        # 將模型和特徵列表，以及從 config 讀取的策略參數一起傳入
         strategy_kwargs = {
             'model': model,
             'features': available_features,
-            **self.strategy_params  # <--- 直接傳遞整個參數字典
+            **self.strategy_params
         }
         
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
         cerebro.broker.setcash(self.wfo_config['initial_cash'])
         cerebro.broker.setcommission(commission=self.wfo_config['commission'])
         
-        # ... 分析器部分不變 ...
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
@@ -192,7 +239,6 @@ class MLOptimizerAndBacktester:
             return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0}
 
     def run_for_single_market(self, market_file_path: Path):
-        # ★★★ 此函式需修改標籤生成方式 ★★★
         self.logger.info(f"{'='*25} 開始處理市場: {market_file_path.stem} {'='*25}")
         df = pd.read_parquet(market_file_path)
         df.index = pd.to_datetime(df.index)
@@ -203,23 +249,17 @@ class MLOptimizerAndBacktester:
             self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_file_path.stem}。")
             return
 
-        # 產生三道門檻標籤
         df = create_triple_barrier_labels(df, self.tb_settings)
         
-        # ★★★ 新增：產生多分類目標 ★★★
-        # 1: 停利 (TP), -1: 停損 (SL), 0: 時間到期 (Timeout)
-        # 我們將其映射為 -> 1: TP, 0: SL, 2: Timeout
-        mapping = {1: 1, -1: 0, 0: 2} 
+        mapping = {1: 1, -1: 0, 0: 2} # 1:TP(win), 0:SL(loss), 2:Timeout
         df['target_multiclass'] = df['label'].map(mapping)
 
-        # 在所有特徵和標籤生成後再刪除 NaN
         df.dropna(inplace=True)
 
         if df.empty:
             self.logger.warning(f"市場 {market_file_path.stem} 在數據清洗後為空，已跳過。")
             return
             
-        # ... 滾動窗口的邏輯不變 ...
         start_date, end_date = df.index.min(), df.index.max()
         train_days, val_days = timedelta(days=self.wfo_config['training_days']), timedelta(days=self.wfo_config['validation_days'])
         test_days, step_days = timedelta(days=self.wfo_config['testing_days']), timedelta(days=self.wfo_config['step_days'])
@@ -231,14 +271,13 @@ class MLOptimizerAndBacktester:
             test_start, test_end = val_start + val_days, val_start + val_days + test_days
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
             
-            df_train, df_val, df_test = df[train_start:val_start], df[val_start:test_start], df[test_start:test_end]
+            df_train, df_val, df_test = df.loc[train_start:val_start], df.loc[val_start:test_start], df.loc[test_start:test_end]
             
             if any(d.empty for d in [df_train, df_val, df_test]):
                 self.logger.warning("當前窗口數據不足，跳過此 Fold。")
                 current_date += step_days
                 continue
                 
-            # ★★★ 使用新的多分類目標 'target_multiclass' ★★★
             X_train, y_train = df_train[available_features], df_train['target_multiclass']
             
             study = optuna.create_study(direction='maximize')
@@ -246,11 +285,9 @@ class MLOptimizerAndBacktester:
             
             self.logger.info(f"參數優化完成！最佳驗證集夏普比率: {study.best_value:.4f}")
             
-            # 使用訓練集+驗證集來訓練最終模型
             X_in_sample = pd.concat([df_train[available_features], df_val[available_features]])
             y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
             
-            # 建立最終模型
             best_params = study.best_params
             best_params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1})
             final_model = lgb.LGBMClassifier(**best_params)
@@ -263,7 +300,6 @@ class MLOptimizerAndBacktester:
             
             current_date += step_days
         
-        # ... 最終報告部分不變 ...
         if not fold_results: 
             self.logger.warning(f"市場 {market_file_path.stem} 沒有足夠數據完成滾動回測。")
             return
@@ -284,15 +320,15 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        # ... 此函式不變 ...
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.0) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.1) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet"))
         input_files = [f for f in all_files if '_D1.parquet' in f.name]
         self.logger.info(f"已篩選出 {len(input_files)} 個 D1 市場檔案進行優先回測。")
         
         if not input_files: 
-            self.logger.error(f"在 {input_dir} 中找不到任何 D1 數據檔案！"); return
+            self.logger.error(f"在 {input_dir} 中找不到任何 D1 數據檔案！")
+            return
         
         for market_file in sorted(input_files):
             try:
@@ -310,7 +346,9 @@ class MLOptimizerAndBacktester:
             self.logger.info("沒有任何市場完成回測。")
         self.logger.info(f"{'='*30} 所有任務執行完畢 {'='*30}")
 
-
+# ==============================================================================
+#                      主程式執行區塊
+# ==============================================================================
 if __name__ == "__main__":
     try:
         config = load_config()
