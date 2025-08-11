@@ -45,7 +45,4 @@ walk_forward_optimization:
 
 # --- 交易策略參數 (用於 04_parameter_optimization.py) ---
 strategy_params:
-  entry_threshold: 0.55 # ★★★ 由於模型目標改變，可適當調回 0.55 觀察 ★★★
-  atr_period: 14
-  atr_sl_multiplier: 2.0
-  atr_tp_multiplier: 3.0
+  entry_threshold: 0.45
