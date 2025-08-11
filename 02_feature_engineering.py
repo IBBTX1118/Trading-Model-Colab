@@ -1,10 +1,11 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.1 (Merge修正版 - 解決跨頻率合併時的欄位衝突問題)
+# 版本: 5.2 (事件整合修正版)
+# 描述: 整合多週期、跨頻率、互動以及宏觀事件特徵。
 
 import logging
 import sys
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict
 import pandas as pd
 import numpy as np
 from finta import TA
@@ -15,6 +16,8 @@ class Config:
     OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Combined_Features_v3")
     LOG_LEVEL = "INFO"
     TIMEFRAME_ORDER = ['D1', 'H4', 'H1']
+    # ★★★ 請確保此路徑與您 Google Drive 的實際專案路徑一致 ★★★
+    EVENTS_FILE_PATH = Path("/content/drive/My Drive/Colab_Projects/Trading-Model-Colab/economic_events.csv")
 
 class FeatureEngineer:
     def __init__(self, config: Config):
@@ -33,7 +36,6 @@ class FeatureEngineer:
         return logger
 
     def _add_base_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """計算基礎技術指標"""
         df_finta = df.copy()
         df_finta.rename(columns={'tick_volume': 'volume'}, inplace=True)
         
@@ -46,13 +48,11 @@ class FeatureEngineer:
                  df_finta[f'{indicator}_14'] = method(df_finta, period=14)
             elif indicator in ['WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI']:
                  df_finta[indicator] = method(df_finta)
-            else: # SMA, EMA
+            else:
                 for p in periods:
                     df_finta[f'{indicator}_{p}'] = method(df_finta, period=p)
 
-        df_finta = df_finta.join(TA.STOCH(df_finta))
-        df_finta = df_finta.join(TA.MACD(df_finta))
-        df_finta = df_finta.join(TA.BBANDS(df_finta))
+        df_finta = df_finta.join(TA.STOCH(df_finta)); df_finta = df_finta.join(TA.MACD(df_finta)); df_finta = df_finta.join(TA.BBANDS(df_finta))
         
         df_finta['body_size'] = abs(df_finta['close'] - df_finta['open'])
         df_finta['upper_wick'] = df_finta['high'] - df_finta[['open', 'close']].max(axis=1)
@@ -64,7 +64,6 @@ class FeatureEngineer:
         return df_finta
 
     def _add_multi_period_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """計算多週期的時間序列特徵"""
         df_out = df.copy()
         for n in [5, 10, 20, 60]:
             df_out[f'returns_{n}p'] = df_out['close'].pct_change(periods=n)
@@ -72,7 +71,6 @@ class FeatureEngineer:
         return df_out
 
     def _add_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """計算互動特徵"""
         df_out = df.copy()
         if 'RSI_14' in df_out.columns and 'volatility_20p' in df_out.columns:
             df_out['RSI_x_volatility'] = (df_out['RSI_14'] - 50) * df_out['volatility_20p']
@@ -80,8 +78,25 @@ class FeatureEngineer:
             df_out['DMI_DIFF_x_ATR'] = df_out['DMI_DIFF'] * df_out['ATR_14']
         return df_out
 
-    def process_symbol_group(self, symbol: str, paths: Dict[str, Path]):
-        """處理單一商品的所有時間頻率數據，並實現跨頻率特徵融合"""
+    def _add_event_features(self, df: pd.DataFrame, events_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        df_out = df.copy()
+        currency1 = symbol[:3].upper(); currency2 = symbol[3:6].upper()
+        
+        relevant_events = events_df[events_df['currency'].isin([currency1, currency2])].copy()
+        if relevant_events.empty:
+            df_out['time_to_next_event'] = 999
+            df_out['next_event_importance'] = 0
+            return df_out
+
+        df_merged = pd.merge_asof(df_out.sort_index(), relevant_events, left_index=True, right_index=True, direction='forward')
+        
+        df_out['time_to_next_event'] = (df_merged.index - df_out.index).total_seconds() / 3600
+        df_out['next_event_importance'] = df_merged['importance_val']
+        
+        df_out.fillna({'time_to_next_event': 999, 'next_event_importance': 0}, inplace=True)
+        return df_out
+
+    def process_symbol_group(self, symbol: str, paths: Dict[str, Path], events_df: pd.DataFrame):
         self.logger.info(f"--- 開始處理商品組: {symbol} ---")
         
         dataframes = {}
@@ -89,39 +104,30 @@ class FeatureEngineer:
             if tf in paths:
                 self.logger.info(f"[{symbol}] 正在處理 {tf} 數據...")
                 df = pd.read_parquet(paths[tf])
-                df_with_features = self._add_base_features(df)
+                
+                df_with_events = self._add_event_features(df, events_df, symbol)
+                df_with_features = self._add_base_features(df_with_events)
                 df_with_features = self._add_multi_period_features(df_with_features)
                 df_with_features = self._add_interaction_features(df_with_features)
                 dataframes[tf] = df_with_features
 
         final_dataframes = {}
-        # ★★★ 核心修正：定義合併時需要從右表移除的欄位，以避免衝突 ★★★
         cols_to_drop_before_merge = ['open', 'high', 'low', 'close', 'tick_volume', 'real_volume', 'spread']
 
-        if 'D1' in dataframes:
-            final_dataframes['D1'] = dataframes['D1']
-
+        if 'D1' in dataframes: final_dataframes['D1'] = dataframes['D1']
         if 'H4' in dataframes and 'D1' in dataframes:
             self.logger.info(f"[{symbol}] 正在為 H4 數據融合 D1 特徵...")
             df_d1_renamed = dataframes['D1'].rename(columns=lambda c: f"D1_{c}" if c not in cols_to_drop_before_merge else c)
             df_d1_features_only = df_d1_renamed.drop(columns=cols_to_drop_before_merge, errors='ignore')
-            final_dataframes['H4'] = pd.merge_asof(
-                dataframes['H4'].sort_index(), df_d1_features_only,
-                left_index=True, right_index=True, direction='backward'
-            )
-        elif 'H4' in dataframes:
-             final_dataframes['H4'] = dataframes['H4']
+            final_dataframes['H4'] = pd.merge_asof(dataframes['H4'].sort_index(), df_d1_features_only, left_index=True, right_index=True, direction='backward')
+        elif 'H4' in dataframes: final_dataframes['H4'] = dataframes['H4']
 
         if 'H1' in dataframes and 'H4' in final_dataframes:
             self.logger.info(f"[{symbol}] 正在為 H1 數據融合 H4/D1 特徵...")
             df_h4_renamed = final_dataframes['H4'].rename(columns=lambda c: f"H4_{c}" if c not in cols_to_drop_before_merge else c)
             df_h4_features_only = df_h4_renamed.drop(columns=cols_to_drop_before_merge, errors='ignore')
-            final_dataframes['H1'] = pd.merge_asof(
-                dataframes['H1'].sort_index(), df_h4_features_only,
-                left_index=True, right_index=True, direction='backward'
-            )
-        elif 'H1' in dataframes:
-            final_dataframes['H1'] = dataframes['H1']
+            final_dataframes['H1'] = pd.merge_asof(dataframes['H1'].sort_index(), df_h4_features_only, left_index=True, right_index=True, direction='backward')
+        elif 'H1' in dataframes: final_dataframes['H1'] = dataframes['H1']
 
         for tf, df_final in final_dataframes.items():
             df_final.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -138,28 +144,28 @@ class FeatureEngineer:
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.1) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.2) =========")
         
-        input_files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
-        if not input_files:
-            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。")
+        try:
+            events_df = pd.read_csv(self.config.EVENTS_FILE_PATH, index_col='timestamp_utc', parse_dates=True)
+            self.logger.info(f"成功從 {self.config.EVENTS_FILE_PATH} 讀取事件數據。")
+        except FileNotFoundError:
+            self.logger.error(f"錯誤：找不到 {self.config.EVENTS_FILE_PATH}！請先執行 01.5 號腳本。")
             return
+            
+        input_files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
+        if not input_files: self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。"); return
 
         symbol_groups = defaultdict(dict)
         for file_path in input_files:
             try:
-                parts = file_path.stem.split('_')
-                symbol = '_'.join(parts[:-1])
-                timeframe = parts[-1]
-                if timeframe in self.config.TIMEFRAME_ORDER:
-                    symbol_groups[symbol][timeframe] = file_path
-            except IndexError:
-                self.logger.warning(f"無法解析檔名: {file_path.name}，已跳過。")
+                parts = file_path.stem.split('_'); symbol = '_'.join(parts[:-1]); timeframe = parts[-1]
+                if timeframe in self.config.TIMEFRAME_ORDER: symbol_groups[symbol][timeframe] = file_path
+            except IndexError: self.logger.warning(f"無法解析檔名: {file_path.name}，已跳過。")
         
         self.logger.info(f"共找到 {len(symbol_groups)} 個商品組需要處理。")
-
         for symbol, paths in symbol_groups.items():
-            self.process_symbol_group(symbol, paths)
+            self.process_symbol_group(symbol, paths, events_df)
             
         self.logger.info("========= 所有檔案處理完畢，綜合特徵工程流程結束 =========")
 
