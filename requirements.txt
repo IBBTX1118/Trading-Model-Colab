@@ -1,6 +1,5 @@
 # 專為 Google Colab 雲端環境
-#讀取設定檔
-PyYAML
+
 # 基礎數據處理
 pandas
 pyarrow
@@ -17,3 +16,10 @@ optuna
 # 回測框架
 backtrader
 matplotlib
+
+# --- 新增的套件 ---
+# 用於讀取 YAML 設定檔
+PyYAML
+
+# 用於獲取宏觀經濟數據
+investpy
