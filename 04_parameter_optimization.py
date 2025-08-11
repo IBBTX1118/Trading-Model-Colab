@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
-# 描述: Phase 2.1 實作：升級為多分類模型，統一出口，實現多空交易。
-# 版本: 7.1 (整合完整版)
+# 描述: Phase 2.2 實作：加入趨勢過濾器。
+# 版本: 7.2 (整合趨勢過濾)
 
 import sys
 import yaml
@@ -18,7 +18,7 @@ import lightgbm as lgb
 import optuna
 
 # ==============================================================================
-#                      輔助函式 (請確保它們存在)
+#                      輔助函式
 # ==============================================================================
 
 def load_config(config_path: str = 'config.yaml') -> Dict:
@@ -46,49 +46,46 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
         entry_price = df_out['close'].iloc[i]
         tp_price = entry_price * (1 + tp_pct)
         sl_price = entry_price * (1 - sl_pct)
-        
         window = df_out.iloc[i+1 : i+1+max_hold]
-        
         hit_tp_time = window[window['high'] >= tp_price].index.min()
         hit_sl_time = window[window['low'] <= sl_price].index.min()
         
         if pd.notna(hit_tp_time) and pd.notna(hit_sl_time):
             if hit_tp_time < hit_sl_time:
                 outcomes.loc[df_out.index[i], 'label'] = 1
-                outcomes.loc[df_out.index[i], 'hit_time'] = hit_tp_time
             else:
                 outcomes.loc[df_out.index[i], 'label'] = -1
-                outcomes.loc[df_out.index[i], 'hit_time'] = hit_sl_time
         elif pd.notna(hit_tp_time):
             outcomes.loc[df_out.index[i], 'label'] = 1
-            outcomes.loc[df_out.index[i], 'hit_time'] = hit_tp_time
         elif pd.notna(hit_sl_time):
             outcomes.loc[df_out.index[i], 'label'] = -1
-            outcomes.loc[df_out.index[i], 'hit_time'] = hit_sl_time
         else:
             outcomes.loc[df_out.index[i], 'label'] = 0
-            outcomes.loc[df_out.index[i], 'hit_time'] = window.index[-1]
             
-    df_out = df_out.join(outcomes)
+    df_out = df_out.join(outcomes[['label']])
     return df_out
 
 # ==============================================================================
-#                      全面升級的交易策略
+#                      整合趨勢過濾的交易策略
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
         ('model', None),
         ('features', None),
-        ('entry_threshold', 0.45), # 機率門檻，可設為優化參數
-        ('tp_pct', 0.015),         # 停利百分比
-        ('sl_pct', 0.01),          # 停損百分比
+        ('entry_threshold', 0.45),
+        ('tp_pct', 0.015),
+        ('sl_pct', 0.01),
     )
     
     def __init__(self):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
-        # self.log(f"策略初始化完成。Entry Threshold: {self.p.entry_threshold}, TP: {self.p.tp_pct:.2%}, SL: {self.p.sl_pct:.2%}")
+        
+        # ★★★ 獲取趨勢過濾指標 ★★★
+        # 如果 'is_uptrend' 特徵存在，就獲取它；否則，建立一個永遠回傳 True 的預設值
+        # 這樣即使在沒有這個特徵的數據上運行，策略也不會出錯
+        self.is_uptrend = getattr(self.data.lines, 'is_uptrend', lambda: True)
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
@@ -104,43 +101,37 @@ class FinalMLStrategy(bt.Strategy):
             return
             
         pred_probs = self.p.model.predict_proba(feature_vector)[0]
-        
-        prob_sl = pred_probs[0]  # Class 0: 觸及停損的機率
-        prob_tp = pred_probs[1]  # Class 1: 觸及停利的機率
-        
+        prob_sl = pred_probs[0]
+        prob_tp = pred_probs[1]
         current_price = self.data.close[0]
+        
+        # ★★★ 獲取當前 K 棒的趨勢狀態 ★★★
+        # self.is_uptrend[0] 會是 1.0 或 0.0，或在 fallback 情況下為 True
+        market_is_uptrend = self.is_uptrend[0] > 0.5 
 
-        # --- 做多邏輯 ---
-        if prob_tp > prob_sl and prob_tp > self.p.entry_threshold:
+        # --- 做多邏輯 (增加趨勢過濾) ---
+        if market_is_uptrend and prob_tp > prob_sl and prob_tp > self.p.entry_threshold:
             sl_price = current_price * (1 - self.p.sl_pct)
             tp_price = current_price * (1 + self.p.tp_pct)
-            self.buy_bracket(
-                price=current_price,
-                stopprice=sl_price,
-                limitprice=tp_price,
-            )
-            self.log(f"建立買單 @ {current_price:.5f}, TP @ {tp_price:.5f}, SL @ {sl_price:.5f}")
+            self.buy_bracket(price=current_price, stopprice=sl_price, limitprice=tp_price)
+            self.log(f"趨勢向上，建立買單 @ {current_price:.5f}")
 
-        # --- 做空邏輯 ---
-        elif prob_sl > prob_tp and prob_sl > self.p.entry_threshold:
+        # --- 做空邏輯 (增加趨勢過濾) ---
+        elif not market_is_uptrend and prob_sl > prob_tp and prob_sl > self.p.entry_threshold:
             sl_price = current_price * (1 + self.p.sl_pct)
             tp_price = current_price * (1 - self.p.tp_pct)
-            self.sell_bracket(
-                price=current_price,
-                stopprice=sl_price,
-                limitprice=tp_price,
-            )
-            self.log(f"建立賣單 @ {current_price:.5f}, TP @ {tp_price:.5f}, SL @ {sl_price:.5f}")
+            self.sell_bracket(price=current_price, stopprice=sl_price, limitprice=tp_price)
+            self.log(f"趨勢向下，建立賣單 @ {current_price:.5f}")
 
 # ==============================================================================
-#                      優化器與回測器 (修改版)
+#                      優化器與回測器
 # ==============================================================================
 class MLOptimizerAndBacktester:
     def __init__(self, config: Dict):
         self.config = config
         self.paths = config['paths']
         self.wfo_config = config['walk_forward_optimization']
-        self.strategy_params = config['strategy_params']
+        self.strategy_params = config.get('strategy_params', {})
         self.tb_settings = config['triple_barrier_settings']
         self.strategy_params['tp_pct'] = self.tb_settings['tp_pct']
         self.strategy_params['sl_pct'] = self.tb_settings['sl_pct']
@@ -166,36 +157,28 @@ class MLOptimizerAndBacktester:
             sys.exit(1)
         with open(file_path, 'r') as f:
             data = json.load(f)
-        self.logger.info(f"成功從 {file_path} 載入 {len(data['selected_features'])} 個全域特徵。")
+        self.logger.info(f"成功從 {file_path} 載入 {len(data.get('selected_features', []))} 個全域特徵。")
         return data
 
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, df_val, available_features: list) -> float:
-        """Optuna 的目標函數，優化驗證集上的夏普比率 (多分類版)"""
         param = {
-            'objective': 'multiclass',
-            'metric': 'multi_logloss',
-            'num_class': 3,
-            'verbosity': -1,
-            'boosting_type': 'gbdt',
+            'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3,
+            'verbosity': -1, 'boosting_type': 'gbdt',
             'n_estimators': trial.suggest_int('n_estimators', 100, 800),
             'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
             'num_leaves': trial.suggest_int('num_leaves', 20, 200),
             'max_depth': trial.suggest_int('max_depth', 3, 10),
             'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
             'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
-            'seed': 42,
-            'n_jobs': -1,
+            'seed': 42, 'n_jobs': -1,
         }
         model = lgb.LGBMClassifier(**param)
         model.fit(X_train.values, y_train.values)
         
         result = self.run_backtest_on_fold(df_val, model, available_features)
-        sharpe = result.get('sharpe_ratio')
+        sharpe = result.get('sharpe_ratio', -1.0)
         
-        if not sharpe or sharpe == 0.0:
-            return -1.0
-            
-        return sharpe
+        return sharpe if sharpe is not None else -1.0
 
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list) -> Dict:
         class PandasDataWithFeatures(bt.feeds.PandasData):
@@ -206,9 +189,7 @@ class MLOptimizerAndBacktester:
         cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
         
         strategy_kwargs = {
-            'model': model,
-            'features': available_features,
-            **self.strategy_params
+            'model': model, 'features': available_features, **self.strategy_params
         }
         
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
@@ -219,24 +200,25 @@ class MLOptimizerAndBacktester:
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
         
-        results = cerebro.run()
-        analysis = results[0].analyzers
-        trades_analysis = analysis.trades.get_analysis()
-        drawdown_analysis = analysis.drawdown.get_analysis()
-        sharpe_analysis = analysis.sharpe.get_analysis()
-        
-        if trades_analysis.get('total', {}).get('total', 0) > 0:
-            sharpe_ratio = sharpe_analysis.get('sharperatio')
-            return {
-                "pnl": trades_analysis.pnl.net.total,
-                "total_trades": trades_analysis.total.total,
-                "won_trades": trades_analysis.won.total,
-                "lost_trades": trades_analysis.lost.total,
-                "max_drawdown": drawdown_analysis.max.drawdown,
-                "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
-            }
-        else:
-            return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0}
+        try:
+            results = cerebro.run()
+            analysis = results[0].analyzers
+            trades_analysis = analysis.trades.get_analysis()
+            drawdown_analysis = analysis.drawdown.get_analysis()
+            sharpe_analysis = analysis.sharpe.get_analysis()
+            
+            if trades_analysis.get('total', {}).get('total', 0) > 0:
+                sharpe_ratio = sharpe_analysis.get('sharperatio')
+                return {
+                    "pnl": trades_analysis.pnl.net.total, "total_trades": trades_analysis.total.total,
+                    "won_trades": trades_analysis.won.total, "lost_trades": trades_analysis.lost.total,
+                    "max_drawdown": drawdown_analysis.max.drawdown,
+                    "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
+                }
+        except Exception as e:
+            self.logger.error(f"回測期間發生錯誤: {e}", exc_info=False)
+
+        return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0}
 
     def run_for_single_market(self, market_file_path: Path):
         self.logger.info(f"{'='*25} 開始處理市場: {market_file_path.stem} {'='*25}")
@@ -245,15 +227,16 @@ class MLOptimizerAndBacktester:
         
         available_features = [f for f in self.selected_features if f in df.columns]
         self.logger.info(f"在 {market_file_path.stem} 中找到 {len(available_features)}/{len(self.selected_features)} 個可用特徵。")
+        if 'is_uptrend' not in available_features:
+            self.logger.warning(f"重要特徵 'is_uptrend' 不存在於 {market_file_path.stem}，跳過此市場。")
+            return
         if len(available_features) < 5:
             self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_file_path.stem}。")
             return
 
         df = create_triple_barrier_labels(df, self.tb_settings)
-        
-        mapping = {1: 1, -1: 0, 0: 2} # 1:TP(win), 0:SL(loss), 2:Timeout
+        mapping = {1: 1, -1: 0, 0: 2}
         df['target_multiclass'] = df['label'].map(mapping)
-
         df.dropna(inplace=True)
 
         if df.empty:
@@ -261,8 +244,10 @@ class MLOptimizerAndBacktester:
             return
             
         start_date, end_date = df.index.min(), df.index.max()
-        train_days, val_days = timedelta(days=self.wfo_config['training_days']), timedelta(days=self.wfo_config['validation_days'])
-        test_days, step_days = timedelta(days=self.wfo_config['testing_days']), timedelta(days=self.wfo_config['step_days'])
+        train_days = timedelta(days=self.wfo_config['training_days'])
+        val_days = timedelta(days=self.wfo_config['validation_days'])
+        test_days = timedelta(days=self.wfo_config['testing_days'])
+        step_days = timedelta(days=self.wfo_config['step_days'])
         current_date, fold_results, fold_number = start_date, [], 0
         
         while current_date + train_days + val_days + test_days <= end_date:
@@ -281,7 +266,7 @@ class MLOptimizerAndBacktester:
             X_train, y_train = df_train[available_features], df_train['target_multiclass']
             
             study = optuna.create_study(direction='maximize')
-            study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, available_features), n_trials=self.wfo_config['n_trials'], show_progress_bar=True)
+            study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, available_features), n_trials=self.wfo_config.get('n_trials', 50), show_progress_bar=True)
             
             self.logger.info(f"參數優化完成！最佳驗證集夏普比率: {study.best_value:.4f}")
             
@@ -303,6 +288,7 @@ class MLOptimizerAndBacktester:
         if not fold_results: 
             self.logger.warning(f"市場 {market_file_path.stem} 沒有足夠數據完成滾動回測。")
             return
+            
         final_pnl = sum(r['pnl'] for r in fold_results)
         total_trades = sum(r['total_trades'] for r in fold_results)
         won_trades = sum(r['won_trades'] for r in fold_results)
@@ -310,17 +296,19 @@ class MLOptimizerAndBacktester:
         avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
         valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r['sharpe_ratio'] is not None and r['sharpe_ratio'] != 0.0]
         avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
-        print("\n" + f"--- {market_file_path.stem} 滾動優化總結報告 ---")
-        print(f"  - 總淨利: {final_pnl:,.2f}")
-        print(f"  - 總交易次數: {total_trades}")
-        print(f"  - 總勝率: {win_rate:.2%}")
-        print(f"  - 平均最大回撤: {avg_max_drawdown:.2f}%")
-        print(f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}")
-        print("-" * 50)
+        
+        report = (f"\n--- {market_file_path.stem} 滾動優化總結報告 ---\n"
+                  f"  - 總淨利: {final_pnl:,.2f}\n"
+                  f"  - 總交易次數: {total_trades}\n"
+                  f"  - 總勝率: {win_rate:.2%}\n"
+                  f"  - 平均最大回撤: {avg_max_drawdown:.2f}%\n"
+                  f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}\n"
+                  f"{'-'*50}")
+        print(report)
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.1) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.2) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet"))
         input_files = [f for f in all_files if '_D1.parquet' in f.name]
@@ -346,15 +334,12 @@ class MLOptimizerAndBacktester:
             self.logger.info("沒有任何市場完成回測。")
         self.logger.info(f"{'='*30} 所有任務執行完畢 {'='*30}")
 
-# ==============================================================================
-#                      主程式執行區塊
-# ==============================================================================
 if __name__ == "__main__":
     try:
         config = load_config()
         optimizer = MLOptimizerAndBacktester(config)
         optimizer.run()
-    except Exception:
+    except Exception as e:
         print(f"腳本執行時發生未預期的嚴重錯誤:")
         traceback.print_exc()
         sys.exit(1)
