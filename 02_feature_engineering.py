@@ -1,5 +1,5 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.2 (事件整合修正版)
+# 版本: 5.3 (整合趨勢過濾特徵)
 # 描述: 整合多週期、跨頻率、互動以及宏觀事件特徵。
 
 import logging
@@ -16,8 +16,7 @@ class Config:
     OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Combined_Features_v3")
     LOG_LEVEL = "INFO"
     TIMEFRAME_ORDER = ['D1', 'H4', 'H1']
-    # ★★★ 請確保此路徑與您 Google Drive 的實際專案路徑一致 ★★★
-    EVENTS_FILE_PATH = Path("/content/drive/My Drive/Colab_Projects/Trading-Model-Colab/economic_events.csv")
+    EVENTS_FILE_PATH = Path("economic_events.csv") # 假設與腳本在同一目錄，或使用絕對路徑
 
 class FeatureEngineer:
     def __init__(self, config: Config):
@@ -109,6 +108,15 @@ class FeatureEngineer:
                 df_with_features = self._add_base_features(df_with_events)
                 df_with_features = self._add_multi_period_features(df_with_features)
                 df_with_features = self._add_interaction_features(df_with_features)
+                
+                # ★★★ 新增趨勢過濾特徵 ★★★
+                if tf == 'D1':
+                    long_ma_period = 200
+                    df_with_features[f'trend_ma_{long_ma_period}'] = TA.SMA(df_with_features, period=long_ma_period)
+                    df_with_features['is_uptrend'] = (df_with_features['close'] > df_with_features[f'trend_ma_{long_ma_period}']).astype(int)
+                    df_with_features.drop(columns=[f'trend_ma_{long_ma_period}'], inplace=True)
+                    self.logger.info(f"[{symbol}/{tf}] 已新增 'is_uptrend' 趨勢過濾特徵。")
+
                 dataframes[tf] = df_with_features
 
         final_dataframes = {}
@@ -124,6 +132,7 @@ class FeatureEngineer:
 
         if 'H1' in dataframes and 'H4' in final_dataframes:
             self.logger.info(f"[{symbol}] 正在為 H1 數據融合 H4/D1 特徵...")
+            # 注意：這裡的 is_uptrend 已經是 D1 的特徵，會被加上 D1_ 前綴，然後再被 H4 繼承
             df_h4_renamed = final_dataframes['H4'].rename(columns=lambda c: f"H4_{c}" if c not in cols_to_drop_before_merge else c)
             df_h4_features_only = df_h4_renamed.drop(columns=cols_to_drop_before_merge, errors='ignore')
             final_dataframes['H1'] = pd.merge_asof(dataframes['H1'].sort_index(), df_h4_features_only, left_index=True, right_index=True, direction='backward')
@@ -144,7 +153,7 @@ class FeatureEngineer:
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.2) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.3) =========")
         
         try:
             events_df = pd.read_csv(self.config.EVENTS_FILE_PATH, index_col='timestamp_utc', parse_dates=True)
@@ -154,14 +163,20 @@ class FeatureEngineer:
             return
             
         input_files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
-        if not input_files: self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。"); return
+        if not input_files:
+            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。")
+            return
 
         symbol_groups = defaultdict(dict)
         for file_path in input_files:
             try:
-                parts = file_path.stem.split('_'); symbol = '_'.join(parts[:-1]); timeframe = parts[-1]
-                if timeframe in self.config.TIMEFRAME_ORDER: symbol_groups[symbol][timeframe] = file_path
-            except IndexError: self.logger.warning(f"無法解析檔名: {file_path.name}，已跳過。")
+                parts = file_path.stem.split('_')
+                symbol = '_'.join(parts[:-1])
+                timeframe = parts[-1]
+                if timeframe in self.config.TIMEFRAME_ORDER:
+                    symbol_groups[symbol][timeframe] = file_path
+            except IndexError:
+                self.logger.warning(f"無法解析檔名: {file_path.name}，已跳過。")
         
         self.logger.info(f"共找到 {len(symbol_groups)} 個商品組需要處理。")
         for symbol, paths in symbol_groups.items():
