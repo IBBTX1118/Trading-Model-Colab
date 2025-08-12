@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
-# 描述: Phase 2.2 實作：加入趨勢過濾器。
-# 版本: 7.4 (修正 Backtrader 分析器命名參數)
+# 描述: Phase 2.3 實作：將策略參數加入 Optuna 優化。
+# 版本: 8.0 (優化策略參數)
 
 import sys
 import yaml
@@ -71,7 +71,7 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     return df_out
 
 # ==============================================================================
-#                      整合趨勢過濾的交易策略
+#                      交易策略 (無變動)
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
@@ -125,6 +125,7 @@ class FinalMLStrategy(bt.Strategy):
 # ==============================================================================
 class MLOptimizerAndBacktester:
     def __init__(self, config: Dict):
+        # ... __init__ 函式無變動 ...
         self.config = config
         self.paths = config['paths']
         self.wfo_config = config['walk_forward_optimization']
@@ -149,6 +150,7 @@ class MLOptimizerAndBacktester:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path) -> Dict:
+        # ... _load_json 函式無變動 ...
         if not file_path.exists():
             self.logger.error(f"致命錯誤: 輸入檔案 {file_path} 不存在！")
             sys.exit(1)
@@ -158,6 +160,7 @@ class MLOptimizerAndBacktester:
         return data
 
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, df_val, available_features: list) -> float:
+        # ★★★ 變動點 1: 優化目標新增 entry_threshold ★★★
         param = {
             'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3,
             'verbosity': -1, 'boosting_type': 'gbdt',
@@ -169,15 +172,25 @@ class MLOptimizerAndBacktester:
             'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
             'seed': 42, 'n_jobs': -1,
         }
+        
+        # 讓 Optuna 建議一個最佳的進場門檻
+        entry_threshold_opt = trial.suggest_float('entry_threshold', 0.40, 0.65, step=0.01)
+
         model = lgb.LGBMClassifier(**param)
         model.fit(X_train.values, y_train.values)
         
-        result = self.run_backtest_on_fold(df_val, model, available_features)
-        sharpe = result.get('sharpe_ratio', -1.0)
+        # 建立一個臨時的策略參數字典，傳入 Optuna 建議的值
+        temp_strategy_params = self.strategy_params.copy()
+        temp_strategy_params['entry_threshold'] = entry_threshold_opt
         
+        # 將這個臨時參數字典傳遞給回測函式
+        result = self.run_backtest_on_fold(df_val, model, available_features, temp_strategy_params)
+        
+        sharpe = result.get('sharpe_ratio', -1.0)
         return sharpe if sharpe is not None else -1.0
 
-    def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list) -> Dict:
+    # ★★★ 變動點 2: 修改函式簽名以接收動態參數 ★★★
+    def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list, strategy_params_override: Dict = None) -> Dict:
         all_feature_columns = [
             col for col in df_fold.columns 
             if col not in ['open', 'high', 'low', 'close', 'tick_volume', 
@@ -191,17 +204,19 @@ class MLOptimizerAndBacktester:
         cerebro = bt.Cerebro(stdstats=False)
         cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
         
+        # 如果有傳入覆蓋參數(來自Optuna)，就使用它，否則使用 self.strategy_params (來自config)
+        final_strategy_params = strategy_params_override if strategy_params_override is not None else self.strategy_params
+        
         strategy_kwargs = {
             'model': model, 
             'features': available_features,
-            **self.strategy_params
+            **final_strategy_params
         }
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
         
         cerebro.broker.setcash(self.wfo_config['initial_cash'])
         cerebro.broker.setcommission(commission=self.wfo_config['commission'])
         
-        # ★★★ 修正 analyzer 的命名參數 (移除結尾多餘的底線) ★★★
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
@@ -215,18 +230,14 @@ class MLOptimizerAndBacktester:
             
             if trades_analysis.get('total', {}).get('total', 0) > 0:
                 sharpe_ratio = sharpe_analysis.get('sharperatio')
-                return {
-                    "pnl": trades_analysis.pnl.net.total, "total_trades": trades_analysis.total.total,
-                    "won_trades": trades_analysis.won.total, "lost_trades": trades_analysis.lost.total,
-                    "max_drawdown": drawdown_analysis.max.drawdown,
-                    "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
-                }
+                return {"pnl": trades_analysis.pnl.net.total, "total_trades": trades_analysis.total.total, "won_trades": trades_analysis.won.total, "lost_trades": trades_analysis.lost.total, "max_drawdown": drawdown_analysis.max.drawdown, "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0}
         except Exception as e:
             self.logger.error(f"回測期間發生錯誤: {e}", exc_info=False)
 
         return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0}
 
     def run_for_single_market(self, market_file_path: Path):
+        # ... run_for_single_market 前半部分無變動 ...
         self.logger.info(f"{'='*25} 開始處理市場: {market_file_path.stem} {'='*25}")
         df = pd.read_parquet(market_file_path)
         df.index = pd.to_datetime(df.index)
@@ -273,22 +284,32 @@ class MLOptimizerAndBacktester:
             study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, available_features), n_trials=self.wfo_config.get('n_trials', 50), show_progress_bar=True)
             
             self.logger.info(f"參數優化完成！最佳驗證集夏普比率: {study.best_value:.4f}")
-            
+            self.logger.info(f"找到的最佳參數: {study.best_params}")
+
             X_in_sample = pd.concat([df_train[available_features], df_val[available_features]])
             y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
             
-            best_params = study.best_params
-            best_params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1})
-            final_model = lgb.LGBMClassifier(**best_params)
+            # 從 study.best_params 中提取模型參數
+            model_params = {k: v for k, v in study.best_params.items() if k != 'entry_threshold'}
+            model_params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1})
+            final_model = lgb.LGBMClassifier(**model_params)
             final_model.fit(X_in_sample.values, y_in_sample.values)
             
-            result = self.run_backtest_on_fold(df_test, final_model, available_features)
+            # ★★★ 變動點 3: 建立最終測試用的策略參數字典 ★★★
+            # 獲取優化找到的最佳 entry_threshold，如果找不到則使用 config 中的預設值
+            best_entry_threshold = study.best_params.get('entry_threshold', self.strategy_params.get('entry_threshold', 0.5))
+            final_test_params = self.strategy_params.copy()
+            final_test_params['entry_threshold'] = best_entry_threshold
+
+            # 將最佳參數應用於最終測試
+            result = self.run_backtest_on_fold(df_test, final_model, available_features, final_test_params)
             fold_results.append(result)
             win_rate = (result['won_trades'] / result['total_trades'] * 100 if result['total_trades'] > 0 else 0)
-            print(f"Fold {fold_number} 測試結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={win_rate:.2f}%")
+            print(f"Fold {fold_number} 測試結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={win_rate:.2f}% (使用最佳門檻: {best_entry_threshold:.2f})")
             
             current_date += step_days
         
+        # ... 總結報告部分無變動 ...
         if not fold_results: 
             self.logger.warning(f"市場 {market_file_path.stem} 沒有足夠數據完成滾動回測。"); return
             
@@ -306,7 +327,8 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.4) {'='*25}")
+        # ... run 函式無變動 ...
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 8.0) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet"))
         input_files = [f for f in all_files if '_D1.parquet' in f.name]
