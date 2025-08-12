@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: Phase 2.2 實作：加入趨勢過濾器。
-# 版本: 7.3 (修正趨勢特徵檢查邏輯)
+# 版本: 7.4 (修正 Backtrader 分析器命名參數)
 
 import sys
 import yaml
@@ -42,7 +42,6 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     
     outcomes = pd.DataFrame(index=df_out.index, columns=['hit_time', 'label'])
     
-    # 為了加速，預先計算 high/low series
     high_series = df_out['high']
     low_series = df_out['low']
     
@@ -87,12 +86,11 @@ class FinalMLStrategy(bt.Strategy):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
-        
         self.is_uptrend = getattr(self.data.lines, 'is_uptrend', lambda: True)
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
-        # print(f'{dt.isoformat()} - {txt}') # 可選擇開啟詳細日誌
+        # print(f'{dt.isoformat()} - {txt}')
 
     def next(self):
         if self.position:
@@ -180,45 +178,33 @@ class MLOptimizerAndBacktester:
         return sharpe if sharpe is not None else -1.0
 
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list) -> Dict:
-        # ★★★ START: 修正後的數據加載邏輯 ★★★
-        
-        # 1. 定義所有需要傳遞給 backtrader 的特徵欄位
-        #    這包括模型需要用的特徵，以及策略邏輯需要用的特徵 (如 is_uptrend)
         all_feature_columns = [
             col for col in df_fold.columns 
             if col not in ['open', 'high', 'low', 'close', 'tick_volume', 
                            'spread', 'real_volume', 'label', 'target_multiclass', 'hit_time']
         ]
 
-        # 2. 動態定義一個包含所有特徵線(lines)的數據類別
         class PandasDataWithFeatures(bt.feeds.PandasData):
-            # 告訴 backtrader 我們有這些額外的數據線
             lines = tuple(all_feature_columns)
-            
-            # 將 'tick_volume' 欄位映射到 backtrader 的 'volume'
-            # 並聲明所有其他特徵線的存在 (-1 表示自動對應同名欄位)
             params = (('volume', 'tick_volume'),) + tuple([(col, -1) for col in all_feature_columns])
 
-        # 3. 實例化 Cerebro 並以正確的方式加入數據
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold)) # <-- 簡潔、正確的呼叫方式
-
-        # ★★★ END: 修正後的數據加載邏輯 ★★★
-
-        # 後續的策略設定、分析器設定和執行邏輯保持不變
+        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
+        
         strategy_kwargs = {
             'model': model, 
-            'features': available_features, # 這是給模型預測用的特徵
+            'features': available_features,
             **self.strategy_params
         }
-        
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
+        
         cerebro.broker.setcash(self.wfo_config['initial_cash'])
         cerebro.broker.setcommission(commission=self.wfo_config['commission'])
         
+        # ★★★ 修正 analyzer 的命名參數 (移除結尾多餘的底線) ★★★
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name_='sharpe')
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
         
         try:
             results = cerebro.run()
@@ -245,7 +231,6 @@ class MLOptimizerAndBacktester:
         df = pd.read_parquet(market_file_path)
         df.index = pd.to_datetime(df.index)
         
-        # ★★★ 修正檢查邏輯 ★★★
         if 'is_uptrend' not in df.columns:
             self.logger.warning(f"重要特徵 'is_uptrend' 不存在於 {market_file_path.stem} 的數據欄位中，跳過此市場。請確認是否已執行 02 號腳本。")
             return
@@ -321,7 +306,7 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.3) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.4) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet"))
         input_files = [f for f in all_files if '_D1.parquet' in f.name]
