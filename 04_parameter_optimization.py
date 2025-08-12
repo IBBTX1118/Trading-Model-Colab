@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: Phase 2.2 實作：加入趨勢過濾器。
-# 版本: 7.2 (整合趨勢過濾)
+# 版本: 7.3 (修正趨勢特徵檢查邏輯)
 
 import sys
 import yaml
@@ -42,13 +42,19 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     
     outcomes = pd.DataFrame(index=df_out.index, columns=['hit_time', 'label'])
     
+    # 為了加速，預先計算 high/low series
+    high_series = df_out['high']
+    low_series = df_out['low']
+    
     for i in range(len(df_out) - max_hold):
         entry_price = df_out['close'].iloc[i]
         tp_price = entry_price * (1 + tp_pct)
         sl_price = entry_price * (1 - sl_pct)
+        
         window = df_out.iloc[i+1 : i+1+max_hold]
-        hit_tp_time = window[window['high'] >= tp_price].index.min()
-        hit_sl_time = window[window['low'] <= sl_price].index.min()
+        
+        hit_tp_time = window[high_series.iloc[i+1:i+1+max_hold] >= tp_price].index.min()
+        hit_sl_time = window[low_series.iloc[i+1:i+1+max_hold] <= sl_price].index.min()
         
         if pd.notna(hit_tp_time) and pd.notna(hit_sl_time):
             if hit_tp_time < hit_sl_time:
@@ -82,9 +88,6 @@ class FinalMLStrategy(bt.Strategy):
             raise ValueError("模型和特徵列表必須提供！")
         self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
         
-        # ★★★ 獲取趨勢過濾指標 ★★★
-        # 如果 'is_uptrend' 特徵存在，就獲取它；否則，建立一個永遠回傳 True 的預設值
-        # 這樣即使在沒有這個特徵的數據上運行，策略也不會出錯
         self.is_uptrend = getattr(self.data.lines, 'is_uptrend', lambda: True)
 
     def log(self, txt, dt=None):
@@ -105,18 +108,14 @@ class FinalMLStrategy(bt.Strategy):
         prob_tp = pred_probs[1]
         current_price = self.data.close[0]
         
-        # ★★★ 獲取當前 K 棒的趨勢狀態 ★★★
-        # self.is_uptrend[0] 會是 1.0 或 0.0，或在 fallback 情況下為 True
         market_is_uptrend = self.is_uptrend[0] > 0.5 
 
-        # --- 做多邏輯 (增加趨勢過濾) ---
         if market_is_uptrend and prob_tp > prob_sl and prob_tp > self.p.entry_threshold:
             sl_price = current_price * (1 - self.p.sl_pct)
             tp_price = current_price * (1 + self.p.tp_pct)
             self.buy_bracket(price=current_price, stopprice=sl_price, limitprice=tp_price)
             self.log(f"趨勢向上，建立買單 @ {current_price:.5f}")
 
-        # --- 做空邏輯 (增加趨勢過濾) ---
         elif not market_is_uptrend and prob_sl > prob_tp and prob_sl > self.p.entry_threshold:
             sl_price = current_price * (1 + self.p.sl_pct)
             tp_price = current_price * (1 - self.p.tp_pct)
@@ -186,10 +185,14 @@ class MLOptimizerAndBacktester:
             params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in available_features])
 
         cerebro = bt.Cerebro(stdstats=False)
-        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
+        # ★★★ 確保把所有 feature 加到 data feed，策略才能透過 getattr 找到 ★★★
+        all_features_in_fold = [col for col in df_fold.columns if col not in ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume', 'label', 'target_multiclass']]
+        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold, **{f: -1 for f in all_features_in_fold}))
         
         strategy_kwargs = {
-            'model': model, 'features': available_features, **self.strategy_params
+            'model': model, 
+            'features': available_features, # 這是給模型預測用的特徵
+            **self.strategy_params
         }
         
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
@@ -225,11 +228,14 @@ class MLOptimizerAndBacktester:
         df = pd.read_parquet(market_file_path)
         df.index = pd.to_datetime(df.index)
         
+        # ★★★ 修正檢查邏輯 ★★★
+        if 'is_uptrend' not in df.columns:
+            self.logger.warning(f"重要特徵 'is_uptrend' 不存在於 {market_file_path.stem} 的數據欄位中，跳過此市場。請確認是否已執行 02 號腳本。")
+            return
+
         available_features = [f for f in self.selected_features if f in df.columns]
         self.logger.info(f"在 {market_file_path.stem} 中找到 {len(available_features)}/{len(self.selected_features)} 個可用特徵。")
-        if 'is_uptrend' not in available_features:
-            self.logger.warning(f"重要特徵 'is_uptrend' 不存在於 {market_file_path.stem}，跳過此市場。")
-            return
+        
         if len(available_features) < 5:
             self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_file_path.stem}。")
             return
@@ -244,10 +250,8 @@ class MLOptimizerAndBacktester:
             return
             
         start_date, end_date = df.index.min(), df.index.max()
-        train_days = timedelta(days=self.wfo_config['training_days'])
-        val_days = timedelta(days=self.wfo_config['validation_days'])
-        test_days = timedelta(days=self.wfo_config['testing_days'])
-        step_days = timedelta(days=self.wfo_config['step_days'])
+        train_days, val_days = timedelta(days=self.wfo_config['training_days']), timedelta(days=self.wfo_config['validation_days'])
+        test_days, step_days = timedelta(days=self.wfo_config['testing_days']), timedelta(days=self.wfo_config['step_days'])
         current_date, fold_results, fold_number = start_date, [], 0
         
         while current_date + train_days + val_days + test_days <= end_date:
@@ -259,9 +263,7 @@ class MLOptimizerAndBacktester:
             df_train, df_val, df_test = df.loc[train_start:val_start], df.loc[val_start:test_start], df.loc[test_start:test_end]
             
             if any(d.empty for d in [df_train, df_val, df_test]):
-                self.logger.warning("當前窗口數據不足，跳過此 Fold。")
-                current_date += step_days
-                continue
+                self.logger.warning("當前窗口數據不足，跳過此 Fold。"); current_date += step_days; continue
                 
             X_train, y_train = df_train[available_features], df_train['target_multiclass']
             
@@ -286,49 +288,39 @@ class MLOptimizerAndBacktester:
             current_date += step_days
         
         if not fold_results: 
-            self.logger.warning(f"市場 {market_file_path.stem} 沒有足夠數據完成滾動回測。")
-            return
+            self.logger.warning(f"市場 {market_file_path.stem} 沒有足夠數據完成滾動回測。"); return
             
-        final_pnl = sum(r['pnl'] for r in fold_results)
-        total_trades = sum(r['total_trades'] for r in fold_results)
-        won_trades = sum(r['won_trades'] for r in fold_results)
+        final_pnl, total_trades, won_trades = sum(r['pnl'] for r in fold_results), sum(r['total_trades'] for r in fold_results), sum(r['won_trades'] for r in fold_results)
         win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
         avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
         valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r['sharpe_ratio'] is not None and r['sharpe_ratio'] != 0.0]
         avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
         
         report = (f"\n--- {market_file_path.stem} 滾動優化總結報告 ---\n"
-                  f"  - 總淨利: {final_pnl:,.2f}\n"
-                  f"  - 總交易次數: {total_trades}\n"
-                  f"  - 總勝率: {win_rate:.2%}\n"
-                  f"  - 平均最大回撤: {avg_max_drawdown:.2f}%\n"
-                  f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}\n"
-                  f"{'-'*50}")
+                  f"  - 總淨利: {final_pnl:,.2f}\n" f"  - 總交易次數: {total_trades}\n"
+                  f"  - 總勝率: {win_rate:.2%}\n" f"  - 平均最大回撤: {avg_max_drawdown:.2f}%\n"
+                  f"  - 平均夏普比率: {avg_sharpe_ratio:.2f}\n" f"{'-'*50}")
         print(report)
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.2) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 7.3) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet"))
         input_files = [f for f in all_files if '_D1.parquet' in f.name]
         self.logger.info(f"已篩選出 {len(input_files)} 個 D1 市場檔案進行優先回測。")
         
-        if not input_files: 
-            self.logger.error(f"在 {input_dir} 中找不到任何 D1 數據檔案！")
-            return
+        if not input_files: self.logger.error(f"在 {input_dir} 中找不到任何 D1 數據檔案！"); return
         
         for market_file in sorted(input_files):
             try:
                 self.run_for_single_market(market_file)
             except Exception:
-                self.logger.error(f"處理市場 {market_file.name} 時發生未預期的錯誤:")
-                traceback.print_exc()
+                self.logger.error(f"處理市場 {market_file.name} 時發生未預期的錯誤:"); traceback.print_exc()
 
         print("\n" + "="*25 + " 所有市場滾動回測最終總結 " + "="*25)
         if self.all_market_results:
-            summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index')
-            summary_df.index.name = 'Market'
+            summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index'); summary_df.index.name = 'Market'
             print("\n" + summary_df.to_string())
         else:
             self.logger.info("沒有任何市場完成回測。")
@@ -340,6 +332,4 @@ if __name__ == "__main__":
         optimizer = MLOptimizerAndBacktester(config)
         optimizer.run()
     except Exception as e:
-        print(f"腳本執行時發生未預期的嚴重錯誤:")
-        traceback.print_exc()
-        sys.exit(1)
+        print(f"腳本執行時發生未預期的嚴重錯誤:"); traceback.print_exc(); sys.exit(1)
