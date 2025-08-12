@@ -1,5 +1,5 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.3 (整合趨勢過濾特徵)
+# 版本: 5.4 (新增波動率標準化與時間特徵)
 # 描述: 整合多週期、跨頻率、互動以及宏觀事件特徵。
 
 import logging
@@ -16,7 +16,7 @@ class Config:
     OUTPUT_BASE_DIR = Path("Output_Feature_Engineering/MarketData_with_Combined_Features_v3")
     LOG_LEVEL = "INFO"
     TIMEFRAME_ORDER = ['D1', 'H4', 'H1']
-    EVENTS_FILE_PATH = Path("economic_events.csv") # 假設與腳本在同一目錄，或使用絕對路徑
+    EVENTS_FILE_PATH = Path("economic_events.csv")
 
 class FeatureEngineer:
     def __init__(self, config: Config):
@@ -38,6 +38,7 @@ class FeatureEngineer:
         df_finta = df.copy()
         df_finta.rename(columns={'tick_volume': 'volume'}, inplace=True)
         
+        # 基礎技術指標
         df_finta = df_finta.join(TA.DMI(df_finta))
         standard_indicators = ['SMA', 'EMA', 'RSI', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI', 'ATR']
         periods = [10, 20, 50]
@@ -53,11 +54,25 @@ class FeatureEngineer:
 
         df_finta = df_finta.join(TA.STOCH(df_finta)); df_finta = df_finta.join(TA.MACD(df_finta)); df_finta = df_finta.join(TA.BBANDS(df_finta))
         
+        # K棒形態特徵
         df_finta['body_size'] = abs(df_finta['close'] - df_finta['open'])
         df_finta['upper_wick'] = df_finta['high'] - df_finta[['open', 'close']].max(axis=1)
         df_finta['lower_wick'] = df_finta[['open', 'close']].min(axis=1) - df_finta['low']
         df_finta['body_vs_wick'] = df_finta['body_size'] / (df_finta['high'] - df_finta['low'] + 1e-9)
         df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
+
+        # ★★★ 新增：波動率標準化特徵 ★★★
+        if 'ATR_14' in df_finta.columns:
+            atr_series = df_finta['ATR_14'] + 1e-9 # 加上極小值避免除以零
+            df_finta['body_size_norm'] = df_finta['body_size'] / atr_series
+            df_finta['DMI_DIFF_norm'] = df_finta['DMI_DIFF'] / atr_series
+            self.logger.debug("Added volatility-normalized features.")
+
+        # ★★★ 新增：時間序列特徵 ★★★
+        df_finta['day_of_week'] = df_finta.index.dayofweek
+        df_finta['week_of_year'] = df_finta.index.isocalendar().week.astype(int)
+        df_finta['month_of_year'] = df_finta.index.month
+        self.logger.debug("Added time-based features.")
 
         df_finta.rename(columns={'volume': 'tick_volume'}, inplace=True)
         return df_finta
@@ -109,7 +124,6 @@ class FeatureEngineer:
                 df_with_features = self._add_multi_period_features(df_with_features)
                 df_with_features = self._add_interaction_features(df_with_features)
                 
-                # ★★★ 新增趨勢過濾特徵 ★★★
                 if tf == 'D1':
                     long_ma_period = 200
                     df_with_features[f'trend_ma_{long_ma_period}'] = TA.SMA(df_with_features, period=long_ma_period)
@@ -132,7 +146,6 @@ class FeatureEngineer:
 
         if 'H1' in dataframes and 'H4' in final_dataframes:
             self.logger.info(f"[{symbol}] 正在為 H1 數據融合 H4/D1 特徵...")
-            # 注意：這裡的 is_uptrend 已經是 D1 的特徵，會被加上 D1_ 前綴，然後再被 H4 繼承
             df_h4_renamed = final_dataframes['H4'].rename(columns=lambda c: f"H4_{c}" if c not in cols_to_drop_before_merge else c)
             df_h4_features_only = df_h4_renamed.drop(columns=cols_to_drop_before_merge, errors='ignore')
             final_dataframes['H1'] = pd.merge_asof(dataframes['H1'].sort_index(), df_h4_features_only, left_index=True, right_index=True, direction='backward')
@@ -153,7 +166,7 @@ class FeatureEngineer:
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.3) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.4) =========")
         
         try:
             events_df = pd.read_csv(self.config.EVENTS_FILE_PATH, index_col='timestamp_utc', parse_dates=True)
@@ -164,8 +177,7 @@ class FeatureEngineer:
             
         input_files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
         if not input_files:
-            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。")
-            return
+            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。"); return
 
         symbol_groups = defaultdict(dict)
         for file_path in input_files:
