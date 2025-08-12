@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
-# 描述: Phase 2.4 實作：引入動態ATR三道門檻標籤法。
-# 版本: 9.0 (動態ATR標籤)
+# 描述: Phase 2.5 實作：轉向 H4 更高頻率數據。
+# 版本: 9.1 (H4 適配版)
 
 import sys
 import yaml
@@ -33,7 +33,6 @@ def load_config(config_path: str = 'config.yaml') -> Dict:
         print(f"致命錯誤: 讀取設定檔 {config_path} 時發生錯誤: {e}")
         sys.exit(1)
 
-# ★★★ 關鍵修改：使用 ATR 動態計算停利停損 ★★★
 def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
     """為 DataFrame 創建基於 ATR 的動態三道門檻標籤。"""
     df_out = df.copy()
@@ -41,7 +40,6 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     sl_multiplier = settings['sl_atr_multiplier']
     max_hold = settings['max_hold_periods']
     
-    # 確保 ATR 欄位存在
     if 'ATR_14' not in df_out.columns:
         raise ValueError("數據中缺少 'ATR_14' 欄位，無法創建 ATR-based 標籤。")
 
@@ -55,7 +53,6 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
         entry_price = df_out['close'].iloc[i]
         atr_at_entry = atr_series.iloc[i]
         
-        # 如果 ATR 為 0 或 NaN，則跳過此 K 棒的標籤
         if atr_at_entry <= 0 or pd.isna(atr_at_entry):
             continue
 
@@ -83,14 +80,13 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     return df_out
 
 # ==============================================================================
-#                      交易策略 (注意：現在停損停利邏輯也要跟著改)
+#                      交易策略
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
         ('model', None),
         ('features', None),
         ('entry_threshold', 0.45),
-        # 停損停利現在也基於 ATR
         ('tp_atr_multiplier', 2.5),
         ('sl_atr_multiplier', 1.5),
     )
@@ -99,12 +95,11 @@ class FinalMLStrategy(bt.Strategy):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
         self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
-        self.is_uptrend = getattr(self.data.lines, 'is_uptrend', lambda: True)
-        # 獲取 ATR 指標，用於計算動態停損停利
+        self.is_uptrend = getattr(self.data.lines, 'D1_is_uptrend', lambda: True) # 注意: 特徵名現在是 D1_is_uptrend
         self.atr = getattr(self.data.lines, 'ATR_14')
 
     def log(self, txt, dt=None):
-        dt = dt or self.datas[0].datetime.date(0)
+        dt = dt or self.datas[0].datetime.datetime(0)
         # print(f'{dt.isoformat()} - {txt}')
 
     def next(self):
@@ -122,11 +117,10 @@ class FinalMLStrategy(bt.Strategy):
         current_price = self.data.close[0]
         atr_value = self.atr[0]
         
-        if atr_value <= 0: return # 如果 ATR 無效，則不交易
+        if atr_value <= 0: return
 
         market_is_uptrend = self.is_uptrend[0] > 0.5 
 
-        # ★★★ 策略的停損停利邏輯也要同步修改為 ATR-based ★★★
         if market_is_uptrend and prob_tp > prob_sl and prob_tp > self.p.entry_threshold:
             sl_dist = atr_value * self.p.sl_atr_multiplier
             tp_dist = atr_value * self.p.tp_atr_multiplier
@@ -149,91 +143,58 @@ class MLOptimizerAndBacktester:
         self.wfo_config = config['walk_forward_optimization']
         self.strategy_params = config.get('strategy_params', {})
         self.tb_settings = config['triple_barrier_settings']
-        # 將 ATR 設定也加入策略參數
         self.strategy_params['tp_atr_multiplier'] = self.tb_settings['tp_atr_multiplier']
         self.strategy_params['sl_atr_multiplier'] = self.tb_settings['sl_atr_multiplier']
         
         self.logger = logging.getLogger(self.__class__.__name__)
-        # ... 後續 __init__ 內容無變動 ...
         if not self.logger.hasHandlers():
-            handler = logging.StreamHandler(sys.stdout)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
+            handler = logging.StreamHandler(sys.stdout); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter); self.logger.addHandler(handler); self.logger.setLevel(logging.INFO)
 
         self.output_base_dir = Path(self.paths['ml_pipeline_output'])
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
         features_file = self.output_base_dir / self.paths['selected_features_filename']
         self.selected_features = self._load_json(features_file)['selected_features']
-        self.all_market_results = {}
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        self.all_market_results = {}; optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def _load_json(self, file_path: Path):
-        # ... 此函式無變動 ...
         if not file_path.exists():
-            self.logger.error(f"致命錯誤: 輸入檔案 {file_path} 不存在！")
-            sys.exit(1)
+            self.logger.error(f"致命錯誤: 輸入檔案 {file_path} 不存在！"); sys.exit(1)
         with open(file_path, 'r') as f:
             data = json.load(f)
         self.logger.info(f"成功從 {file_path} 載入 {len(data.get('selected_features', []))} 個全域特徵。")
         return data
     
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, df_val, available_features: list) -> float:
-        # ... 此函式無變動，繼續優化模型參數和 entry_threshold ...
         param = {
-            'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3,
-            'verbosity': -1, 'boosting_type': 'gbdt',
-            'n_estimators': trial.suggest_int('n_estimators', 100, 800),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 20, 200),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
-            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
+            'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1, 'boosting_type': 'gbdt',
+            'n_estimators': trial.suggest_int('n_estimators', 100, 800), 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 200), 'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True), 'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
             'seed': 42, 'n_jobs': -1,
         }
-        
         entry_threshold_opt = trial.suggest_float('entry_threshold', 0.40, 0.65, step=0.01)
-        model = lgb.LGBMClassifier(**param)
-        model.fit(X_train.values, y_train.values)
-        
-        temp_strategy_params = self.strategy_params.copy()
-        temp_strategy_params['entry_threshold'] = entry_threshold_opt
-        
+        model = lgb.LGBMClassifier(**param); model.fit(X_train.values, y_train.values)
+        temp_strategy_params = self.strategy_params.copy(); temp_strategy_params['entry_threshold'] = entry_threshold_opt
         result = self.run_backtest_on_fold(df_val, model, available_features, temp_strategy_params)
-        
         sharpe = result.get('sharpe_ratio', -1.0)
         return sharpe if sharpe is not None else -1.0
     
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list, strategy_params_override: Dict = None) -> Dict:
-        # ... 此函式無變動 ...
         all_feature_columns = [col for col in df_fold.columns if col not in ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume', 'label', 'target_multiclass', 'hit_time']]
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(all_feature_columns)
             params = (('volume', 'tick_volume'),) + tuple([(col, -1) for col in all_feature_columns])
-
         cerebro = bt.Cerebro(stdstats=False)
         cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
-        
         final_strategy_params = strategy_params_override if strategy_params_override is not None else self.strategy_params
-        
         strategy_kwargs = {'model': model, 'features': available_features, **final_strategy_params}
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
-        
-        cerebro.broker.setcash(self.wfo_config['initial_cash'])
-        cerebro.broker.setcommission(commission=self.wfo_config['commission'])
-        
-        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
-        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-        
+        cerebro.broker.setcash(self.wfo_config['initial_cash']); cerebro.broker.setcommission(commission=self.wfo_config['commission'])
+        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades'); cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown'); cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
         try:
-            results = cerebro.run()
-            analysis = results[0].analyzers
-            trades_analysis = analysis.trades.get_analysis()
-            drawdown_analysis = analysis.drawdown.get_analysis()
-            sharpe_analysis = analysis.sharpe.get_analysis()
-            
+            results = cerebro.run(); analysis = results[0].analyzers
+            trades_analysis = analysis.trades.get_analysis(); drawdown_analysis = analysis.drawdown.get_analysis(); sharpe_analysis = analysis.sharpe.get_analysis()
             if trades_analysis.get('total', {}).get('total', 0) > 0:
                 sharpe_ratio = sharpe_analysis.get('sharperatio')
                 return {"pnl": trades_analysis.pnl.net.total, "total_trades": trades_analysis.total.total, "won_trades": trades_analysis.won.total, "lost_trades": trades_analysis.lost.total, "max_drawdown": drawdown_analysis.max.drawdown, "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0}
@@ -242,30 +203,28 @@ class MLOptimizerAndBacktester:
         return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, "sharpe_ratio": 0.0}
 
     def run_for_single_market(self, market_file_path: Path):
-        # ... 此函式前半部分無變動，直到標籤創建 ...
         self.logger.info(f"{'='*25} 開始處理市場: {market_file_path.stem} {'='*25}")
         df = pd.read_parquet(market_file_path)
         df.index = pd.to_datetime(df.index)
         
-        if 'is_uptrend' not in df.columns:
-            self.logger.warning(f"重要特徵 'is_uptrend' 不存在於 {market_file_path.stem} 的數據欄位中，跳過此市場。")
-            return
-        available_features = [f for f in self.selected_features if f in df.columns]
-        self.logger.info(f"在 {market_file_path.stem} 中找到 {len(available_features)}/{len(self.selected_features)} 個可用特徵。")
-        if len(available_features) < 5:
-            self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_file_path.stem}。")
+        # 在 H4 數據中，來自 D1 的特徵會被加上 'D1_' 前綴
+        d1_uptrend_feature_name = 'D1_is_uptrend'
+        if d1_uptrend_feature_name not in df.columns:
+            self.logger.warning(f"重要特徵 '{d1_uptrend_feature_name}' 不存在於 {market_file_path.stem} 的數據欄位中，跳過此市場。")
             return
 
-        # 創建標籤的步驟不變，但內部邏輯已更新
+        available_features = [f for f in self.selected_features if f in df.columns]
+        self.logger.info(f"在 {market_file_path.stem} 中找到 {len(available_features)}/{len(self.selected_features)} 個可用特徵。")
+        
+        if len(available_features) < 5:
+            self.logger.warning(f"可用特徵過少 (<5)，跳過市場 {market_file_path.stem}。"); return
+
         df = create_triple_barrier_labels(df, self.tb_settings)
-        # ... 後續無變動 ...
-        mapping = {1: 1, -1: 0, 0: 2}
-        df['target_multiclass'] = df['label'].map(mapping)
+        mapping = {1: 1, -1: 0, 0: 2}; df['target_multiclass'] = df['label'].map(mapping)
         df.dropna(inplace=True)
 
         if df.empty:
-            self.logger.warning(f"市場 {market_file_path.stem} 在數據清洗後為空，已跳過。")
-            return
+            self.logger.warning(f"市場 {market_file_path.stem} 在數據清洗後為空，已跳過。"); return
             
         start_date, end_date = df.index.min(), df.index.max()
         train_days, val_days = timedelta(days=self.wfo_config['training_days']), timedelta(days=self.wfo_config['validation_days'])
@@ -290,17 +249,13 @@ class MLOptimizerAndBacktester:
             self.logger.info(f"參數優化完成！最佳驗證集夏普比率: {study.best_value:.4f}")
             self.logger.info(f"找到的最佳參數: {study.best_params}")
 
-            X_in_sample = pd.concat([df_train[available_features], df_val[available_features]])
-            y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
-            
+            X_in_sample = pd.concat([df_train[available_features], df_val[available_features]]); y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
             model_params = {k: v for k, v in study.best_params.items() if k != 'entry_threshold'}
             model_params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1})
-            final_model = lgb.LGBMClassifier(**model_params)
-            final_model.fit(X_in_sample.values, y_in_sample.values)
+            final_model = lgb.LGBMClassifier(**model_params); final_model.fit(X_in_sample.values, y_in_sample.values)
             
             best_entry_threshold = study.best_params.get('entry_threshold', self.strategy_params.get('entry_threshold', 0.5))
-            final_test_params = self.strategy_params.copy()
-            final_test_params['entry_threshold'] = best_entry_threshold
+            final_test_params = self.strategy_params.copy(); final_test_params['entry_threshold'] = best_entry_threshold
 
             result = self.run_backtest_on_fold(df_test, final_model, available_features, final_test_params)
             fold_results.append(result)
@@ -325,14 +280,14 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        # ... 此函式無變動 ...
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 9.0) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 9.1 - H4) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet"))
-        input_files = [f for f in all_files if '_D1.parquet' in f.name]
-        self.logger.info(f"已篩選出 {len(input_files)} 個 D1 市場檔案進行優先回測。")
+        # ★★★ 關鍵修改：讀取 H4 檔案 ★★★
+        input_files = [f for f in all_files if '_H4.parquet' in f.name]
+        self.logger.info(f"已篩選出 {len(input_files)} 個 H4 市場檔案進行回測。")
         
-        if not input_files: self.logger.error(f"在 {input_dir} 中找不到任何 D1 數據檔案！"); return
+        if not input_files: self.logger.error(f"在 {input_dir} 中找不到任何 H4 數據檔案！"); return
         
         for market_file in sorted(input_files):
             try:
