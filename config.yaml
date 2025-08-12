@@ -29,10 +29,10 @@ feature_selection:
 
 # --- ★★★ 新增：三道門檻標籤法設定 (用於 04_parameter_optimization.py) ★★★ ---
 triple_barrier_settings:
-  tp_pct: 0.015  # 停利目標：上漲 1.5%
-  sl_pct: 0.01   # 停損目標：下跌 1.0%
-  max_hold_periods: 20 # 最長持倉 K 棒數
-
+  tp_atr_multiplier: 2.5  # 停利目標為 2.5 倍 ATR
+  sl_atr_multiplier: 1.5  # 停損目標為 1.5 倍 ATR
+  max_hold_periods: 20
+  
 # --- 滾動優化與回測設定 (用於 04_parameter_optimization.py) ---
 walk_forward_optimization:
   n_trials: 50
