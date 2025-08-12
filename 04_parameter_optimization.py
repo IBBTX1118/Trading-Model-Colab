@@ -180,15 +180,32 @@ class MLOptimizerAndBacktester:
         return sharpe if sharpe is not None else -1.0
 
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list) -> Dict:
-        class PandasDataWithFeatures(bt.feeds.PandasData):
-            lines = tuple(available_features)
-            params = (('volume', 'tick_volume'),) + tuple([(f, -1) for f in available_features])
-
-        cerebro = bt.Cerebro(stdstats=False)
-        # ★★★ 確保把所有 feature 加到 data feed，策略才能透過 getattr 找到 ★★★
-        all_features_in_fold = [col for col in df_fold.columns if col not in ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume', 'label', 'target_multiclass']]
-        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold, **{f: -1 for f in all_features_in_fold}))
+        # ★★★ START: 修正後的數據加載邏輯 ★★★
         
+        # 1. 定義所有需要傳遞給 backtrader 的特徵欄位
+        #    這包括模型需要用的特徵，以及策略邏輯需要用的特徵 (如 is_uptrend)
+        all_feature_columns = [
+            col for col in df_fold.columns 
+            if col not in ['open', 'high', 'low', 'close', 'tick_volume', 
+                           'spread', 'real_volume', 'label', 'target_multiclass', 'hit_time']
+        ]
+
+        # 2. 動態定義一個包含所有特徵線(lines)的數據類別
+        class PandasDataWithFeatures(bt.feeds.PandasData):
+            # 告訴 backtrader 我們有這些額外的數據線
+            lines = tuple(all_feature_columns)
+            
+            # 將 'tick_volume' 欄位映射到 backtrader 的 'volume'
+            # 並聲明所有其他特徵線的存在 (-1 表示自動對應同名欄位)
+            params = (('volume', 'tick_volume'),) + tuple([(col, -1) for col in all_feature_columns])
+
+        # 3. 實例化 Cerebro 並以正確的方式加入數據
+        cerebro = bt.Cerebro(stdstats=False)
+        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold)) # <-- 簡潔、正確的呼叫方式
+
+        # ★★★ END: 修正後的數據加載邏輯 ★★★
+
+        # 後續的策略設定、分析器設定和執行邏輯保持不變
         strategy_kwargs = {
             'model': model, 
             'features': available_features, # 這是給模型預測用的特徵
@@ -201,7 +218,7 @@ class MLOptimizerAndBacktester:
         
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name_='sharpe')
         
         try:
             results = cerebro.run()
