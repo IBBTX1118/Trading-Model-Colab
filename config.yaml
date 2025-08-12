@@ -36,10 +36,10 @@ triple_barrier_settings:
 # --- 滾動優化與回測設定 (用於 04_parameter_optimization.py) ---
 walk_forward_optimization:
   n_trials: 50
-  training_days: 540
-  validation_days: 180
-  testing_days: 90
-  step_days: 90
+  training_days: 270      # 縮短為約 9 個月
+  validation_days: 90     # 縮短為約 3 個月
+  testing_days: 45        # 縮短為約 1.5 個月
+  step_days: 45           # 滾動步長也跟著縮短
   initial_cash: 100000.0
   commission: 0.001
 
