@@ -1,5 +1,5 @@
 # ==============================================================================
-# 全域設定檔 for 量化交易模型 v5.0 (Phase 2)
+# 全域設定檔 for 量化交易模型 v10.0 (H4 - 全參數優化)
 # ==============================================================================
 
 # --- 路徑設定 ---
@@ -10,10 +10,8 @@ paths:
   selected_features_filename: "selected_features.json"
 
 # --- 標籤與特徵篩選設定 (用於 03_feature_selection.py) ---
-# ★★★ Phase 2 中，04 腳本將不再使用此區塊的標籤設定 ★★★
+# 注意：標籤設定已與 04 腳本同步，由下方的 triple_barrier_settings 控制
 feature_selection:
-  label_look_forward_periods: 12
-  label_return_threshold: 0.003
   top_n_features: 20
   lgbm_params:
     objective: 'binary'
@@ -24,25 +22,28 @@ feature_selection:
     num_leaves: 31
     max_depth: -1
     seed: 42
-    n_jobs': -1
+    n_jobs: -1
     verbose: -1
 
-# --- ★★★ 新增：三道門檻標籤法設定 (用於 04_parameter_optimization.py) ★★★ ---
+# --- 動態三道門檻標籤法設定 (ATR-Based) ---
+# 這是目前策略的核心定義，同時被 03 和 04 腳本使用
 triple_barrier_settings:
-  tp_atr_multiplier: 2.5  # 停利目標為 2.5 倍 ATR
-  sl_atr_multiplier: 1.5  # 停損目標為 1.5 倍 ATR
-  max_hold_periods: 20
-  
-# --- 滾動優化與回測設定 (用於 04_parameter_optimization.py) ---
+  tp_atr_multiplier: 2.5      # 停利目標倍數 (Optuna 會在此基礎上尋找最優值)
+  sl_atr_multiplier: 1.5      # 停損目標倍數 (Optuna 會在此基礎上尋找最優值)
+  max_hold_periods: 20        # 最長持倉 K 棒數 (20根H4 K棒 = 80小時)
+
+# --- 滾動優化與回測設定 (已為 H4 數據調整) ---
 walk_forward_optimization:
-  n_trials: 50
-  training_days: 270      # 縮短為約 9 個月
-  validation_days: 90     # 縮短為約 3 個月
-  testing_days: 45        # 縮短為約 1.5 個月
-  step_days: 45           # 滾動步長也跟著縮短
+  n_trials: 50                # Optuna 優化的嘗試次數
+  training_days: 270          # 訓練期：約 9 個月
+  validation_days: 90         # 驗證期：約 3 個月
+  testing_days: 45            # 測試期：約 1.5 個月
+  step_days: 45               # 每次滾動的步長
   initial_cash: 100000.0
   commission: 0.001
 
-# --- 交易策略參數 (用於 04_parameter_optimization.py) ---
+# --- 交易策略參數 ---
+# 注意：此區塊的參數現在主要由 04 號腳本中的 Optuna 動態優化決定
+# config.yaml 中的值僅作為後備或初始參考
 strategy_params:
-  entry_threshold: 0.45
+  entry_threshold: 0.45 # 這個值會被 Optuna 在 [0.40, 0.65] 區間內優化
