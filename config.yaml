@@ -34,7 +34,7 @@ triple_barrier_settings:
 
 # --- 滾動優化與回測設定 (已為 H4 數據調整) ---
 walk_forward_optimization:
-  n_trials: 5                # Optuna 優化的嘗試次數
+  n_trials: 50                # Optuna 優化的嘗試次數
   training_days: 270          # 訓練期：約 9 個月
   validation_days: 90         # 驗證期：約 3 個月
   testing_days: 45            # 測試期：約 1.5 個月
