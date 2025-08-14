@@ -140,44 +140,62 @@ class MLOptimizerAndBacktester:
         return sharpe if sharpe is not None else -1.0
     
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model: lgb.LGBMClassifier, available_features: list, strategy_params_override: Dict = None) -> Dict:
-        # ★★★ 新增 SQN 分析器 ★★★
-        all_feature_columns = [col for col in df_fold.columns if col not in ['open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume', 'label', 'target_multiclass', 'hit_time']]
+        """執行單一 Fold 的回測並返回詳細的績效指標"""
+        all_feature_columns = [
+            col for col in df_fold.columns 
+            if col not in ['open', 'high', 'low', 'close', 'tick_volume', 
+                           'spread', 'real_volume', 'label', 'target_multiclass', 'hit_time']
+        ]
+
         class PandasDataWithFeatures(bt.feeds.PandasData):
-            lines = tuple(all_feature_columns); params = (('volume', 'tick_volume'),) + tuple([(col, -1) for col in all_feature_columns])
-        cerebro = bt.Cerebro(stdstats=False); cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
+            lines = tuple(all_feature_columns)
+            params = (('volume', 'tick_volume'),) + tuple([(col, -1) for col in all_feature_columns])
+        
+        cerebro = bt.Cerebro(stdstats=False)
+        cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
+        
         final_strategy_params = strategy_params_override if strategy_params_override is not None else self.strategy_params
         strategy_kwargs = {'model': model, 'features': available_features, **final_strategy_params}
         cerebro.addstrategy(FinalMLStrategy, **strategy_kwargs)
-        cerebro.broker.setcash(self.wfo_config['initial_cash']); cerebro.broker.setcommission(commission=self.wfo_config['commission'])
+        
+        cerebro.broker.setcash(self.wfo_config['initial_cash'])
+        cerebro.broker.setcommission(commission=self.wfo_config['commission'])
+        
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-        cerebro.addanalyzer(bt.analyzers.SQN, _name='sqn') # 新增 SQN
+        cerebro.addanalyzer(bt.analyzers.SQN, _name='sqn')
         
-        # ★★★ 擴展返回的結果字典 ★★★
         try:
-            results = cerebro.run(); analysis = results[0].analyzers
-            trades_analysis = analysis.trades.get_analysis(); drawdown_analysis = analysis.drawdown.get_analysis()
-            sharpe_analysis = analysis.sharpe.get_analysis(); sqn_analysis = analysis.sqn.get_analysis()
+            results = cerebro.run()
+            analysis = results[0].analyzers
+            trades_analysis = analysis.trades.get_analysis()
             
-            pnl_net_total = trades_analysis.pnl.net.total or 0
-            total_won = trades_analysis.won.total or 0
-            total_lost = trades_analysis.lost.total or 0
-            pnl_won_total = trades_analysis.won.pnl.total or 0
-            pnl_lost_total = trades_analysis.lost.pnl.total or 0
-            
-            profit_factor = pnl_won_total / abs(pnl_lost_total) if pnl_lost_total != 0 else float('inf')
-
             if trades_analysis.get('total', {}).get('total', 0) > 0:
-                sharpe_ratio = sharpe_analysis.get('sharperatio')
+                sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
+                # 當有交易時，返回包含所有欄位的字典
                 return {
-                    "pnl": pnl_net_total, "total_trades": trades_analysis.total.total,
-                    "won_trades": total_won, "lost_trades": total_lost,
-                    "profit_factor": profit_factor,
-                    "sqn": sqn_analysis.get('sqn'),
-                    "max_drawdown": drawdown_analysis.max.drawdown,
+                    "pnl": trades_analysis.pnl.net.total or 0.0,
+                    "total_trades": trades_analysis.total.total,
+                    "won_trades": trades_analysis.won.total or 0,
+                    "lost_trades": trades_analysis.lost.total or 0,
+                    "pnl_won_total": trades_analysis.won.pnl.total or 0.0,
+                    "pnl_lost_total": trades_analysis.lost.pnl.total or 0.0,
+                    "sqn": analysis.sqn.get_analysis().get('sqn'),
+                    "max_drawdown": analysis.drawdown.get_analysis().max.drawdown,
                     "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
                 }
+        except Exception as e:
+            self.logger.error(f"回測期間發生錯誤: {e}", exc_info=False)
+
+        # ★★★ 關鍵修改 ★★★
+        # 當沒有交易或發生錯誤時，返回一個結構相同、但值為 0 的完整字典
+        return {
+            "pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, 
+            "max_drawdown": 0.0, "sharpe_ratio": 0.0, 
+            "pnl_won_total": 0.0, "pnl_lost_total": 0.0, 
+            "sqn": 0.0, "profit_factor": 0.0
+        }
         except Exception as e:
             self.logger.error(f"回測期間發生錯誤: {e}", exc_info=False)
         return {"pnl": 0.0, "total_trades": 0, "won_trades": 0, "lost_trades": 0, "max_drawdown": 0.0, 
