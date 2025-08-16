@@ -1,5 +1,5 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.5 (整合 DXY 與 VIX 全局宏觀因子)
+# 版本: 5.6 (修正 finta 用法並整合全局因子)
 # 描述: 整合多週期、跨頻率、互動以及宏觀事件與全局因子特徵。
 
 import logging
@@ -18,7 +18,6 @@ class Config:
     TIMEFRAME_ORDER = ['D1', 'H4', 'H1']
     EVENTS_FILE_PATH = Path("economic_events.csv")
     # ★★★ 新增：全局因子檔案路徑 ★★★
-    # 請確保此路徑與 01.6 腳本的輸出路徑一致
     GLOBAL_FACTORS_FILE_PATH = Path("global_factors.parquet")
 
 class FeatureEngineer:
@@ -37,14 +36,12 @@ class FeatureEngineer:
             logger.addHandler(sh)
         return logger
         
-    # ★★★ 新增：添加全局因子特徵的函數 ★★★
     def _add_global_factor_features(self, df: pd.DataFrame, factors_df: pd.DataFrame) -> pd.DataFrame:
-        """將全局因子數據合併，並從中創建特徵"""
+        """將全局因子數據合併，並從中創建特徵 (已修正 finta 用法)"""
         if factors_df is None or factors_df.empty:
             return df
 
         # 使用 merge_asof 將日線的因子數據合併到當前的時間頻率數據中
-        # direction='backward' 表示使用最近的一個已知因子值
         df_merged = pd.merge_asof(
             df.sort_index(), 
             factors_df, 
@@ -54,21 +51,20 @@ class FeatureEngineer:
         )
         
         # --- 從合併後的因子數據創建新特徵 ---
-        # 1. DXY 的變化率 (1日、5日)
         if 'DXY_close' in df_merged.columns:
-            # 由於 merge_asof 可能會導致重複的因子值，直接 pct_change 可能不準確
-            # 我們應該先對因子數據本身計算特徵，再合併
-            # 這裡為了簡化，暫時使用合併後計算，但需注意潛在 lookahead 問題
-            # 更嚴謹的方式是先計算好日線的pct_change再merge
             df_merged['DXY_return_1d'] = df_merged['DXY_close'].pct_change(periods=1)
             df_merged['DXY_return_5d'] = df_merged['DXY_close'].pct_change(periods=5)
 
-        # 2. VIX 的移動平均 (20日)，觀察恐慌情緒的趨勢
         if 'VIX_close' in df_merged.columns:
-            # 暫時使用 df_merged['VIX_close'] 計算 SMA，但在高頻率數據上會有重複值
-            # 這裡假設每日只有一個主要價格點影響 SMA 計算
-            df_merged['VIX_SMA_20'] = TA.SMA(df_merged, col='VIX_close', period=20)
-            # VIX 相對於其20日均線的偏離程度
+            # 為了正確使用 TA.SMA，需先將 VIX_close 欄位暫時改名為 'close'
+            temp_vix_df = df_merged[['VIX_close']].rename(columns={'VIX_close': 'close'})
+            
+            # 現在可以在這個暫時的 DataFrame 上計算 SMA
+            vix_sma_series = TA.SMA(temp_vix_df, period=20)
+            
+            # 將計算結果 (一個 Series) 賦值回原本的 df_merged
+            df_merged['VIX_SMA_20'] = vix_sma_series
+            
             if 'VIX_SMA_20' in df_merged.columns and df_merged['VIX_SMA_20'].notna().any():
                  df_merged['VIX_vs_SMA20'] = (df_merged['VIX_close'] - df_merged['VIX_SMA_20']) / (df_merged['VIX_SMA_20'] + 1e-9)
 
@@ -105,7 +101,7 @@ class FeatureEngineer:
 
         # 波動率標準化特徵
         if 'ATR_14' in df_finta.columns:
-            atr_series = df_finta['ATR_14'] + 1e-9 # 加上極小值避免除以零
+            atr_series = df_finta['ATR_14'] + 1e-9
             df_finta['body_size_norm'] = df_finta['body_size'] / atr_series
             if 'DMI_DIFF' in df_finta.columns:
                 df_finta['DMI_DIFF_norm'] = df_finta['DMI_DIFF'] / atr_series
@@ -138,7 +134,10 @@ class FeatureEngineer:
     def _add_event_features(self, df: pd.DataFrame, events_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         df_out = df.copy()
         if events_df is None or events_df.empty:
-             df_out['time_to_next_event'] = 999; df_out['next_event_importance'] = 0; return df_out
+            df_out['time_to_next_event'] = 999
+            df_out['next_event_importance'] = 0
+            return df_out
+        
         currency1 = symbol[:3].upper(); currency2 = symbol[3:6].upper()
         
         relevant_events = events_df[events_df['currency'].isin([currency1, currency2])].copy()
@@ -148,17 +147,15 @@ class FeatureEngineer:
             return df_out
 
         df_merged = pd.merge_asof(df_out.sort_index(), relevant_events, left_index=True, right_index=True, direction='forward')
-        
-        # The index of df_merged will be the same as df_out after merge_asof
         df_merged.index = df_out.index
         
-        df_out['time_to_next_event'] = (df_merged['event_timestamp'] - df_out.index).total_seconds() / 3600
+        df_out['time_to_next_event'] = (pd.to_datetime(df_merged['timestamp_utc'], utc=True) - df_out.index).total_seconds() / 3600
         df_out['next_event_importance'] = df_merged['importance_val']
         
         df_out.fillna({'time_to_next_event': 999, 'next_event_importance': 0}, inplace=True)
         return df_out
 
-    def process_symbol_group(self, symbol: str, paths: Dict[str, Path], events_df: pd.DataFrame, factors_df: pd.DataFrame): # ★★★ 新增 factors_df 參數 ★★★
+    def process_symbol_group(self, symbol: str, paths: Dict[str, Path], events_df: pd.DataFrame, factors_df: pd.DataFrame):
         self.logger.info(f"--- 開始處理商品組: {symbol} ---")
         
         dataframes = {}
@@ -167,10 +164,7 @@ class FeatureEngineer:
                 self.logger.info(f"[{symbol}] 正在處理 {tf} 數據...")
                 df = pd.read_parquet(paths[tf])
                 
-                # ★★★ 在此處調用新函數，整合全局因子 ★★★
                 df_with_factors = self._add_global_factor_features(df, factors_df)
-
-                # 後續流程使用 df_with_factors 繼續
                 df_with_events = self._add_event_features(df_with_factors, events_df, symbol)
                 df_with_features = self._add_base_features(df_with_events)
                 df_with_features = self._add_multi_period_features(df_with_features)
@@ -218,30 +212,23 @@ class FeatureEngineer:
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.5 + Global Factors) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.6) =========")
         
-        # 讀取事件數據
         events_df = None
         try:
-            # 修正讀取事件數據的邏輯，避免 'event_timestamp' 欄位不存在的錯誤
-            temp_events_df = pd.read_csv(self.config.EVENTS_FILE_PATH, parse_dates=True)
-            temp_events_df['event_timestamp'] = pd.to_datetime(temp_events_df['timestamp_utc'], utc=True)
-            events_df = temp_events_df.set_index('event_timestamp').sort_index()
-            self.logger.info(f"成功從 {self.config.EVENTS_FILE_PATH} 讀取並處理事件數據。")
+            events_df = pd.read_csv(self.config.EVENTS_FILE_PATH, index_col='timestamp_utc', parse_dates=True)
+            events_df.index = pd.to_datetime(events_df.index, utc=True)
+            self.logger.info(f"成功從 {self.config.EVENTS_FILE_PATH} 讀取事件數據。")
         except FileNotFoundError:
-            self.logger.error(f"錯誤：找不到 {self.config.EVENTS_FILE_PATH}！請先執行 01.5 號腳本。")
-        except Exception as e:
-            self.logger.error(f"讀取事件檔案時發生錯誤: {e}")
-
-        # ★★★ 新增：讀取全局因子數據 ★★★
+            self.logger.warning(f"警告：找不到事件檔案 {self.config.EVENTS_FILE_PATH}！將不添加事件特徵。")
+        
         factors_df = None
         try:
             factors_df = pd.read_parquet(self.config.GLOBAL_FACTORS_FILE_PATH)
-            # 確保索引是 timezone-aware 以便與主數據框匹配
             factors_df.index = pd.to_datetime(factors_df.index, utc=True)
             self.logger.info(f"成功從 {self.config.GLOBAL_FACTORS_FILE_PATH} 讀取全局因子數據。")
         except FileNotFoundError:
-            self.logger.warning(f"警告：找不到 {self.config.GLOBAL_FACTORS_FILE_PATH}！將不添加全局因子特徵。")
+            self.logger.warning(f"警告：找不到全局因子檔案 {self.config.GLOBAL_FACTORS_FILE_PATH}！將不添加全局因子特徵。")
             
         input_files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
         if not input_files:
@@ -260,7 +247,6 @@ class FeatureEngineer:
         
         self.logger.info(f"共找到 {len(symbol_groups)} 個商品組需要處理。")
         for symbol, paths in symbol_groups.items():
-             # ★★★ 將 factors_df 傳遞進去 ★★★
             self.process_symbol_group(symbol, paths, events_df, factors_df)
             
         self.logger.info("========= 所有檔案處理完畢，綜合特徵工程流程結束 =========")
