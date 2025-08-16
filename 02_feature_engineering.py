@@ -1,5 +1,5 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.6 (修正 finta 用法並整合全局因子)
+# 版本: 5.7 (改用 pandas 計算 SMA 並整合全局因子)
 # 描述: 整合多週期、跨頻率、互動以及宏觀事件與全局因子特徵。
 
 import logging
@@ -17,7 +17,6 @@ class Config:
     LOG_LEVEL = "INFO"
     TIMEFRAME_ORDER = ['D1', 'H4', 'H1']
     EVENTS_FILE_PATH = Path("economic_events.csv")
-    # ★★★ 新增：全局因子檔案路徑 ★★★
     GLOBAL_FACTORS_FILE_PATH = Path("global_factors.parquet")
 
 class FeatureEngineer:
@@ -37,11 +36,10 @@ class FeatureEngineer:
         return logger
         
     def _add_global_factor_features(self, df: pd.DataFrame, factors_df: pd.DataFrame) -> pd.DataFrame:
-        """將全局因子數據合併，並從中創建特徵 (已修正 finta 用法)"""
+        """將全局因子數據合併，並從中創建特徵 (改用 pandas 計算 SMA)"""
         if factors_df is None or factors_df.empty:
             return df
 
-        # 使用 merge_asof 將日線的因子數據合併到當前的時間頻率數據中
         df_merged = pd.merge_asof(
             df.sort_index(), 
             factors_df, 
@@ -56,14 +54,8 @@ class FeatureEngineer:
             df_merged['DXY_return_5d'] = df_merged['DXY_close'].pct_change(periods=5)
 
         if 'VIX_close' in df_merged.columns:
-            # 為了正確使用 TA.SMA，需先將 VIX_close 欄位暫時改名為 'close'
-            temp_vix_df = df_merged[['VIX_close']].rename(columns={'VIX_close': 'close'})
-            
-            # 現在可以在這個暫時的 DataFrame 上計算 SMA
-            vix_sma_series = TA.SMA(temp_vix_df, period=20)
-            
-            # 將計算結果 (一個 Series) 賦值回原本的 df_merged
-            df_merged['VIX_SMA_20'] = vix_sma_series
+            # 改用 pandas 內建的 rolling().mean() 來計算 SMA，不再使用 finta
+            df_merged['VIX_SMA_20'] = df_merged['VIX_close'].rolling(window=20).mean()
             
             if 'VIX_SMA_20' in df_merged.columns and df_merged['VIX_SMA_20'].notna().any():
                  df_merged['VIX_vs_SMA20'] = (df_merged['VIX_close'] - df_merged['VIX_SMA_20']) / (df_merged['VIX_SMA_20'] + 1e-9)
@@ -149,7 +141,7 @@ class FeatureEngineer:
         df_merged = pd.merge_asof(df_out.sort_index(), relevant_events, left_index=True, right_index=True, direction='forward')
         df_merged.index = df_out.index
         
-        df_out['time_to_next_event'] = (pd.to_datetime(df_merged['timestamp_utc'], utc=True) - df_out.index).total_seconds() / 3600
+        df_out['time_to_next_event'] = (pd.to_datetime(df_merged.index.to_series().bfill(), utc=True) - df_out.index).total_seconds() / 3600
         df_out['next_event_importance'] = df_merged['importance_val']
         
         df_out.fillna({'time_to_next_event': 999, 'next_event_importance': 0}, inplace=True)
@@ -202,7 +194,8 @@ class FeatureEngineer:
             rows_before = len(df_final)
             df_final.dropna(inplace=True)
             rows_after = len(df_final)
-            self.logger.info(f"[{symbol}/{tf}] 移除了 {rows_before - rows_after} 行包含 NaN 的數據。剩餘 {rows_after} 筆。")
+            if rows_before > rows_after:
+                self.logger.info(f"[{symbol}/{tf}] 移除了 {rows_before - rows_after} 行包含 NaN 的數據。剩餘 {rows_after} 筆。")
             
             relative_path = paths[tf].relative_to(self.config.INPUT_BASE_DIR)
             output_path = self.config.OUTPUT_BASE_DIR / relative_path
@@ -212,7 +205,7 @@ class FeatureEngineer:
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.6) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.7) =========")
         
         events_df = None
         try:
