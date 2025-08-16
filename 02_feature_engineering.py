@@ -1,5 +1,5 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.7 (改用 pandas 計算 SMA 並整合全局因子)
+# 版本: 5.8 (修正事件特徵合併邏輯)
 # 描述: 整合多週期、跨頻率、互動以及宏觀事件與全局因子特徵。
 
 import logging
@@ -48,13 +48,11 @@ class FeatureEngineer:
             direction='backward'
         )
         
-        # --- 從合併後的因子數據創建新特徵 ---
         if 'DXY_close' in df_merged.columns:
             df_merged['DXY_return_1d'] = df_merged['DXY_close'].pct_change(periods=1)
             df_merged['DXY_return_5d'] = df_merged['DXY_close'].pct_change(periods=5)
 
         if 'VIX_close' in df_merged.columns:
-            # 改用 pandas 內建的 rolling().mean() 來計算 SMA，不再使用 finta
             df_merged['VIX_SMA_20'] = df_merged['VIX_close'].rolling(window=20).mean()
             
             if 'VIX_SMA_20' in df_merged.columns and df_merged['VIX_SMA_20'].notna().any():
@@ -67,7 +65,6 @@ class FeatureEngineer:
         df_finta = df.copy()
         df_finta.rename(columns={'tick_volume': 'volume'}, inplace=True)
         
-        # 基礎技術指標
         df_finta = df_finta.join(TA.DMI(df_finta))
         standard_indicators = ['SMA', 'EMA', 'RSI', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI', 'ATR']
         periods = [10, 20, 50]
@@ -83,7 +80,6 @@ class FeatureEngineer:
 
         df_finta = df_finta.join(TA.STOCH(df_finta)); df_finta = df_finta.join(TA.MACD(df_finta)); df_finta = df_finta.join(TA.BBANDS(df_finta))
         
-        # K棒形態特徵
         df_finta['body_size'] = abs(df_finta['close'] - df_finta['open'])
         df_finta['upper_wick'] = df_finta['high'] - df_finta[['open', 'close']].max(axis=1)
         df_finta['lower_wick'] = df_finta[['open', 'close']].min(axis=1) - df_finta['low']
@@ -91,7 +87,6 @@ class FeatureEngineer:
         if 'DI+' in df_finta.columns and 'DI-' in df_finta.columns:
             df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
 
-        # 波動率標準化特徵
         if 'ATR_14' in df_finta.columns:
             atr_series = df_finta['ATR_14'] + 1e-9
             df_finta['body_size_norm'] = df_finta['body_size'] / atr_series
@@ -99,7 +94,6 @@ class FeatureEngineer:
                 df_finta['DMI_DIFF_norm'] = df_finta['DMI_DIFF'] / atr_series
             self.logger.debug("Added volatility-normalized features.")
 
-        # 時間序列特徵
         df_finta['day_of_week'] = df_finta.index.dayofweek
         df_finta['week_of_year'] = df_finta.index.isocalendar().week.astype(int)
         df_finta['month_of_year'] = df_finta.index.month
@@ -124,13 +118,15 @@ class FeatureEngineer:
         return df_out
 
     def _add_event_features(self, df: pd.DataFrame, events_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """將宏觀事件數據合併，並計算相關特徵 (已修正時間戳處理邏輯與 .dt 用法)"""
         df_out = df.copy()
         if events_df is None or events_df.empty:
             df_out['time_to_next_event'] = 999
             df_out['next_event_importance'] = 0
             return df_out
         
-        currency1 = symbol[:3].upper(); currency2 = symbol[3:6].upper()
+        currency1 = symbol[:3].upper()
+        currency2 = symbol[3:6].upper()
         
         relevant_events = events_df[events_df['currency'].isin([currency1, currency2])].copy()
         if relevant_events.empty:
@@ -138,10 +134,25 @@ class FeatureEngineer:
             df_out['next_event_importance'] = 0
             return df_out
 
-        df_merged = pd.merge_asof(df_out.sort_index(), relevant_events, left_index=True, right_index=True, direction='forward')
+        # 1. 將 relevant_events 的索引（事件時間戳）重設為一個普通欄位，以便在合併時保留
+        relevant_events.reset_index(inplace=True)
+
+        # 2. 執行 merge_asof，左邊用索引，右邊用 'timestamp_utc' 欄位進行匹配
+        df_merged = pd.merge_asof(
+            left=df_out.sort_index(), 
+            right=relevant_events.sort_values('timestamp_utc'), 
+            left_index=True, 
+            right_on='timestamp_utc', 
+            direction='forward'
+        )
         df_merged.index = df_out.index
         
-        df_out['time_to_next_event'] = (pd.to_datetime(df_merged.index.to_series().bfill(), utc=True) - df_out.index).total_seconds() / 3600
+        # 3. 計算時間差，'timestamp_utc' 欄位現在儲存的是下一個事件的時間
+        time_diff = df_merged['timestamp_utc'] - df_out.index
+        
+        # 4. 使用 .dt.total_seconds() 將整列時間差轉換為秒
+        df_out['time_to_next_event'] = time_diff.dt.total_seconds() / 3600
+        
         df_out['next_event_importance'] = df_merged['importance_val']
         
         df_out.fillna({'time_to_next_event': 999, 'next_event_importance': 0}, inplace=True)
@@ -205,7 +216,7 @@ class FeatureEngineer:
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.7) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.8) =========")
         
         events_df = None
         try:
