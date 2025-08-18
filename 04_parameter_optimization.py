@@ -1,6 +1,6 @@
 # 檔名: 04_parameter_optimization.py
 # 描述: 智能加載市場專屬特徵集，並對優勢策略進行參數精細化調整。
-# 版本: 12.0 (專屬特徵 + 參數精調)
+# 版本: 12.1 (實施方案一與方案二優化)
 
 import sys; import yaml; import json; from pathlib import Path; from typing import List, Dict, Any
 import pandas as pd; import numpy as np; from datetime import timedelta; import traceback; import logging
@@ -88,19 +88,18 @@ class MLOptimizerAndBacktester:
             self.logger.info(f"成功將數據儲存至: {file_path}")
         except Exception as e: self.logger.error(f"儲存 JSON 檔案至 {file_path} 時發生錯誤: {e}")
 
-    # ★★★ 關鍵修改：引入市場名稱，進行參數精細化 ★★★
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, df_val, available_features: list, market_name: str) -> float:
         model_param = {'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1, 'boosting_type': 'gbdt',
                        'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True), 'seed': 42, 'n_jobs': -1}
         
-        # 根據市場名稱，設定不同的優化區間
         if "USDJPY" in market_name:
             self.logger.debug(f"為 {market_name} 應用精細化參數範圍。")
             model_param['n_estimators'] = trial.suggest_int('n_estimators', 100, 500)
             model_param['num_leaves'] = trial.suggest_int('num_leaves', 20, 100)
             model_param['max_depth'] = trial.suggest_int('max_depth', 3, 6)
             strategy_param_updates = {
-                'entry_threshold': trial.suggest_float('entry_threshold', 0.50, 0.65, step=0.01),
+                # ★★★ 方案一：放寬進場門檻的搜索範圍 ★★★
+                'entry_threshold': trial.suggest_float('entry_threshold', 0.40, 0.55, step=0.01),
                 'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 2.0, 4.0),
                 'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.0, 2.0),
             }
@@ -110,7 +109,8 @@ class MLOptimizerAndBacktester:
             model_param['num_leaves'] = trial.suggest_int('num_leaves', 20, 120)
             model_param['max_depth'] = trial.suggest_int('max_depth', 3, 7)
             strategy_param_updates = {
-                'entry_threshold': trial.suggest_float('entry_threshold', 0.40, 0.55, step=0.01),
+                # ★★★ 方案一：放寬進場門檻的搜索範圍 ★★★
+                'entry_threshold': trial.suggest_float('entry_threshold', 0.35, 0.50, step=0.01),
                 'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.5, 3.0),
                 'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.0, 2.0),
             }
@@ -119,7 +119,8 @@ class MLOptimizerAndBacktester:
             model_param['num_leaves'] = trial.suggest_int('num_leaves', 20, 150)
             model_param['max_depth'] = trial.suggest_int('max_depth', 3, 8)
             strategy_param_updates = {
-                'entry_threshold': trial.suggest_float('entry_threshold', 0.40, 0.65, step=0.01),
+                # ★★★ 方案一：放寬進場門檻的搜索範圍 ★★★
+                'entry_threshold': trial.suggest_float('entry_threshold', 0.35, 0.55, step=0.01),
                 'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.5, 4.0),
                 'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.0, 2.5),
             }
@@ -130,7 +131,15 @@ class MLOptimizerAndBacktester:
         if strategy_param_updates['tp_atr_multiplier'] <= strategy_param_updates['sl_atr_multiplier']: return -999.0
         model = lgb.LGBMClassifier(**model_param); model.fit(X_train, y_train)
         temp_strategy_params = {**self.strategy_params, **strategy_param_updates}
+        
         result = self.run_backtest_on_fold(df_val, model, available_features, temp_strategy_params)
+        
+        # ★★★ 方案二：修改優化目標，懲罰交易次數過少的模型 ★★★
+        # 設定一個最低交易次數門檻，例如 10 次
+        min_trades_threshold = 10
+        if result.get('total_trades', 0) < min_trades_threshold:
+            return -999.0 # 給予極低的懲罰分數，讓 Optuna 放棄這個參數組合
+
         sharpe = result.get('sharpe_ratio', -1.0); return sharpe if sharpe is not None else -1.0
     
     def run_backtest_on_fold(self, df_fold, model, available_features, strategy_params_override=None):
@@ -156,7 +165,6 @@ class MLOptimizerAndBacktester:
         market_name = market_file_path.stem
         self.logger.info(f"{'='*25} 開始處理市場: {market_name} {'='*25}")
         
-        # ★★★ 關鍵修改：智能加載市場專屬特徵檔案 ★★★
         features_filename = self.output_base_dir / f"selected_features_{market_name}.json"
         features_data = self._load_json(features_filename)
         if not features_data: self.logger.warning(f"找不到市場 {market_name} 的特徵檔案，跳過。"); return
@@ -231,7 +239,7 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "profit_factor": profit_factor, "avg_sqn": avg_sqn, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 12.0 - H4) {'='*25}")
+        self.logger.info(f"{'='*25} 整合式滾動優化與回測流程開始 (版本 12.1 - H4) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet")); input_files = [f for f in all_files if '_H4.parquet' in f.name]
         self.logger.info(f"已篩選出 {len(input_files)} 個 H4 市場檔案進行回測。")
