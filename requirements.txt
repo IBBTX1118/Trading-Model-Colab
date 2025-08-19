@@ -16,6 +16,8 @@ optuna
 # 回測框架
 backtrader
 matplotlib
+xgboost
+catboost
 
 # --- 新增的套件 ---
 # 用於讀取 YAML 設定檔
