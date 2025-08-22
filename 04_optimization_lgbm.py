@@ -1,6 +1,6 @@
 # 檔名: 04_optimization_lgbm.py
 # 描述: 使用 LightGBM 模型進行參數優化與回測。
-# 版本: 13.1 (整合動態倉位管理)
+# 版本: 13.2 (優化目標改為 SQN)
 
 import sys; import yaml; import json; from pathlib import Path; from typing import Dict
 import pandas as pd; import numpy as np; from datetime import timedelta; import traceback; import logging
@@ -43,7 +43,7 @@ class FinalMLStrategy(bt.Strategy):
         ('entry_threshold', 0.45), 
         ('tp_atr_multiplier', 2.5), 
         ('sl_atr_multiplier', 1.5),
-        ('risk_per_trade', 0.01), # ★★★ 新增：從設定檔讀取的每筆交易風險 ★★★
+        ('risk_per_trade', 0.01),
     )
 
     def __init__(self):
@@ -53,7 +53,7 @@ class FinalMLStrategy(bt.Strategy):
         self.is_uptrend = getattr(self.data.lines, d1_uptrend_name, lambda: True)
         atr_name = 'D1_ATR_14' if hasattr(self.data.lines, 'D1_ATR_14') else 'ATR_14'
         self.atr = getattr(self.data.lines, atr_name)
-        self.order = None # 用於追蹤訂單狀態
+        self.order = None
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
@@ -68,9 +68,8 @@ class FinalMLStrategy(bt.Strategy):
         self.order = None
 
     def log(self, txt, dt=None):
-        ''' 日誌記錄函數 '''
         dt = dt or self.datas[0].datetime.date(0)
-        # print(f'{dt.isoformat()} - {txt}') # 可選：取消註解以顯示詳細日誌
+        # print(f'{dt.isoformat()} - {txt}')
 
     def next(self):
         if self.order or self.position:
@@ -86,7 +85,6 @@ class FinalMLStrategy(bt.Strategy):
         current_price, atr_value = self.data.close[0], self.atr[0]
         if atr_value <= 0: return
 
-        # ★★★ 核心修改：計算動態倉位大小 ★★★
         portfolio_value = self.broker.getvalue()
         sl_dist_points = atr_value * self.p.sl_atr_multiplier
         if sl_dist_points == 0: return
@@ -120,9 +118,7 @@ class MLOptimizerAndBacktester:
         self.strategy_params = config.get('strategy_params', {}); self.tb_settings = config['triple_barrier_settings']
         self.strategy_params['tp_atr_multiplier'] = self.tb_settings.get('tp_atr_multiplier', 2.5)
         self.strategy_params['sl_atr_multiplier'] = self.tb_settings.get('sl_atr_multiplier', 1.5)
-        # ★★★ 新增：讀取 risk_per_trade 參數 ★★★
         self.strategy_params['risk_per_trade'] = self.strategy_params.get('risk_per_trade', 0.01)
-
         self.logger = logging.getLogger(self.__class__.__name__)
         if not self.logger.hasHandlers():
             handler = logging.StreamHandler(sys.stdout); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -158,15 +154,21 @@ class MLOptimizerAndBacktester:
             'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.5, 4.0),
             'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.0, 2.5),
         }
-        if strategy_param_updates['tp_atr_multiplier'] <= strategy_param_updates['sl_atr_multiplier']: return -999.0
+        if strategy_param_updates['tp_atr_multiplier'] <= strategy_param_updates['sl_atr_multiplier']: 
+            return -999.0
+        
         model = lgb.LGBMClassifier(**model_param)
         model.fit(X_train, y_train)
         temp_strategy_params = {**self.strategy_params, **strategy_param_updates}
         result = self.run_backtest_on_fold(df_val, model, available_features, temp_strategy_params)
-        min_trades_threshold = 10
-        if result.get('total_trades', 0) < min_trades_threshold: return -999.0
-        sharpe = result.get('sharpe_ratio', -1.0)
-        return sharpe if sharpe is not None else -1.0
+        
+        min_trades_threshold = 10 # 在驗證期間，至少需要10筆交易
+        if result.get('total_trades', 0) < min_trades_threshold:
+            return -999.0
+
+        # ★★★ 核心修改：將優化目標從 sharpe_ratio 改為 sqn ★★★
+        sqn = result.get('sqn', -5.0) # 如果沒有SQN，給一個很差的分數
+        return sqn if sqn is not None else -5.0
     
     def run_backtest_on_fold(self, df_fold, model, available_features, strategy_params_override=None):
         all_feature_columns = [c for c in df_fold.columns if c not in ['open','high','low','close','tick_volume','spread','real_volume','label','target_multiclass','hit_time']]
@@ -215,8 +217,8 @@ class MLOptimizerAndBacktester:
             X_train, y_train = df_train[available_features], df_train['target_multiclass']
             study = optuna.create_study(direction='maximize')
             study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, available_features, market_name), n_trials=self.wfo_config.get('n_trials', 50), show_progress_bar=True)
-            self.logger.info(f"優化完成！最佳驗證集夏普: {study.best_value:.4f}"); self.logger.info(f"最佳參數: {study.best_params}")
-            params_with_fold = {'fold': fold_number, 'best_sharpe_in_val': study.best_value, **study.best_params}; all_fold_best_params.append(params_with_fold)
+            self.logger.info(f"優化完成！最佳驗證集 SQN: {study.best_value:.4f}"); self.logger.info(f"最佳參數: {study.best_params}") # 修改日誌
+            params_with_fold = {'fold': fold_number, 'best_sqn_in_val': study.best_value, **study.best_params}; all_fold_best_params.append(params_with_fold)
             X_in_sample = pd.concat([df_train[available_features], df_val[available_features]])
             y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
             model_params = {k: v for k, v in study.best_params.items() if k not in self.strategy_params.keys() and k not in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier']}
@@ -251,7 +253,7 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "profit_factor": profit_factor, "avg_sqn": avg_sqn, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} LightGBM 整合式滾動優化與回測流程開始 (版本 13.1) {'='*25}")
+        self.logger.info(f"{'='*25} LightGBM 整合式滾動優化與回測流程開始 (版本 13.2) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet")); input_files = [f for f in all_files if '_H4.parquet' in f.name]
         self.logger.info(f"已篩選出 {len(input_files)} 個 H4 市場檔案進行回測。")
