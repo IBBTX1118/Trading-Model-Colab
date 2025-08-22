@@ -34,16 +34,15 @@ triple_barrier_settings:
 
 # --- 滾動優化與回測設定 (已為 H4 數據調整) ---
 walk_forward_optimization:
-  n_trials: 5                # Optuna 優化的嘗試次數
-  training_days: 270          # 訓練期：約 9 個月
-  validation_days: 90         # 驗證期：約 3 個月
-  testing_days: 45            # 測試期：約 1.5 個月
-  step_days: 45               # 每次滾動的步長
+  n_trials: 5
+  training_days: 270
+  validation_days: 90
+  testing_days: 45
+  step_days: 45
   initial_cash: 100000.0
   commission: 0.001
 
 # --- 交易策略參數 ---
-# 注意：此區塊的參數現在主要由 04 號腳本中的 Optuna 動態優化決定
-# config.yaml 中的值僅作為後備或初始參考
 strategy_params:
-  entry_threshold: 0.45 # 這個值會被 Optuna 在 [0.40, 0.65] 區間內優化
+  entry_threshold: 0.45
+  risk_per_trade: 0.01  # ★★★ 確保此行已新增：每筆交易風險佔總資金的 1% ★★★
