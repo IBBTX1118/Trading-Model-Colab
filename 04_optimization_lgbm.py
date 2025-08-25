@@ -1,6 +1,6 @@
 # 檔名: 04_optimization_lgbm.py
 # 描述: 使用 LightGBM 模型進行參數優化與回測。
-# 版本: 13.2 (優化目標改為 SQN)
+# 版本: 13.3 (修復數據格式問題並穩定回測流程)
 
 import sys; import yaml; import json; from pathlib import Path; from typing import Dict
 import pandas as pd; import numpy as np; from datetime import timedelta; import traceback; import logging
@@ -34,7 +34,7 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     df_out = df_out.join(outcomes[['label']]); df_out['target'] = (df_out['label'] == 1).astype(int); return df_out
 
 # ==============================================================================
-#                      交易策略 (版本 2.0 - 引入動態倉位管理)
+#                      交易策略 (版本 2.1 - 修復數據格式問題)
 # ==============================================================================
 class FinalMLStrategy(bt.Strategy):
     params = (
@@ -48,7 +48,7 @@ class FinalMLStrategy(bt.Strategy):
 
     def __init__(self):
         if not self.p.model or not self.p.features: raise ValueError("模型和特徵列表必須提供！")
-        self.feature_lines = [getattr(self.data.lines, f) for f in self.p.features]
+        # ★★★ 核心修改：不再創建 self.feature_lines，直接使用特徵名稱 ★★★
         d1_uptrend_name = 'D1_is_uptrend' if hasattr(self.data.lines, 'D1_is_uptrend') else 'is_uptrend'
         self.is_uptrend = getattr(self.data.lines, d1_uptrend_name, lambda: True)
         atr_name = 'D1_ATR_14' if hasattr(self.data.lines, 'D1_ATR_14') else 'ATR_14'
@@ -56,15 +56,11 @@ class FinalMLStrategy(bt.Strategy):
         self.order = None
 
     def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
+        if order.status in [order.Submitted, order.Accepted]: return
         if order.status in [order.Completed]:
-            if order.isbuy():
-                self.log(f'BUY EXECUTED, Price: {order.executed.price:.5f}, Size: {order.executed.size:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
-            elif order.issell():
-                self.log(f'SELL EXECUTED, Price: {order.executed.price:.5f}, Size: {order.executed.size:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log('Order Canceled/Margin/Rejected')
+            if order.isbuy(): self.log(f'BUY EXECUTED, Price: {order.executed.price:.5f}, Size: {order.executed.size:.2f}')
+            elif order.issell(): self.log(f'SELL EXECUTED, Price: {order.executed.price:.5f}, Size: {order.executed.size:.2f}')
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]: self.log('Order Canceled/Margin/Rejected')
         self.order = None
 
     def log(self, txt, dt=None):
@@ -72,22 +68,26 @@ class FinalMLStrategy(bt.Strategy):
         # print(f'{dt.isoformat()} - {txt}')
 
     def next(self):
-        if self.order or self.position:
+        if self.order or self.position or len(self.data) == 0:
             return
-        try: 
-            feature_vector = np.array([line[0] for line in self.feature_lines]).reshape(1, -1)
-        except IndexError: 
+
+        # ★★★ 核心修改：直接從數據線構建帶有欄位名的 DataFrame 進行預測 ★★★
+        try:
+            feature_data = {feat: getattr(self.datas[0].lines, feat)[0] for feat in self.p.features}
+            feature_df = pd.DataFrame([feature_data], columns=self.p.features)
+        except Exception as e:
+            # self.log(f"無法獲取特徵向量: {e}") # 可選：用於調試
             return
-        
-        pred_probs = self.p.model.predict_proba(feature_vector)[0]
+
+        pred_probs = self.p.model.predict_proba(feature_df)[0]
         prob_sl, prob_tp, prob_hold = pred_probs[0], pred_probs[1], pred_probs[2]
         
         current_price, atr_value = self.data.close[0], self.atr[0]
-        if atr_value <= 0: return
+        if atr_value <= 0 or pd.isna(atr_value): return
 
         portfolio_value = self.broker.getvalue()
         sl_dist_points = atr_value * self.p.sl_atr_multiplier
-        if sl_dist_points == 0: return
+        if sl_dist_points <= 0: return
             
         size = (portfolio_value * self.p.risk_per_trade) / sl_dist_points
         
@@ -158,34 +158,61 @@ class MLOptimizerAndBacktester:
             return -999.0
         
         model = lgb.LGBMClassifier(**model_param)
-        model.fit(X_train, y_train)
+        # 確保訓練時使用 DataFrame
+        model.fit(X_train, y_train) 
+        
         temp_strategy_params = {**self.strategy_params, **strategy_param_updates}
         result = self.run_backtest_on_fold(df_val, model, available_features, temp_strategy_params)
         
-        min_trades_threshold = 10 # 在驗證期間，至少需要10筆交易
+        min_trades_threshold = 10 
         if result.get('total_trades', 0) < min_trades_threshold:
             return -999.0
 
-        # ★★★ 核心修改：將優化目標從 sharpe_ratio 改為 sqn ★★★
-        sqn = result.get('sqn', -5.0) # 如果沒有SQN，給一個很差的分數
+        sqn = result.get('sqn', -5.0) 
         return sqn if sqn is not None else -5.0
     
     def run_backtest_on_fold(self, df_fold, model, available_features, strategy_params_override=None):
         all_feature_columns = [c for c in df_fold.columns if c not in ['open','high','low','close','tick_volume','spread','real_volume','label','target_multiclass','hit_time']]
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines=tuple(all_feature_columns); params=(('volume','tick_volume'),)+tuple([(c,-1) for c in all_feature_columns])
-        cerebro=bt.Cerebro(stdstats=False); cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
+        
+        cerebro=bt.Cerebro(stdstats=False)
+        # ★★★ 關鍵修改：確保傳入的 df_fold 的欄位名與 all_feature_columns 一致 ★★★
+        data_feed = PandasDataWithFeatures(dataname=df_fold[all_feature_columns + ['open','high','low','close','tick_volume']])
+        cerebro.adddata(data_feed)
+
         final_strategy_params=strategy_params_override if strategy_params_override is not None else self.strategy_params
         strategy_kwargs={'model':model,'features':available_features,**final_strategy_params}; cerebro.addstrategy(FinalMLStrategy,**strategy_kwargs)
+        
         cerebro.broker.setcash(self.wfo_config['initial_cash']); cerebro.broker.setcommission(commission=self.wfo_config['commission'])
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer,_name='trades'); cerebro.addanalyzer(bt.analyzers.DrawDown,_name='drawdown')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio,_name='sharpe'); cerebro.addanalyzer(bt.analyzers.SQN,_name='sqn')
+        
         try:
-            results=cerebro.run(); analysis=results[0].analyzers; trades_analysis=analysis.trades.get_analysis()
-            if trades_analysis.get('total',{}).get('total',0)>0:
+            results=cerebro.run()
+            if not results: return {} # 如果回測沒有結果，返回空字典
+            analysis=results[0].analyzers
+            trades_analysis=analysis.trades.get_analysis()
+            
+            # 確保有交易才計算指標
+            if trades_analysis.get('total',{}).get('total',0) > 0:
                 sharpe_ratio=analysis.sharpe.get_analysis().get('sharperatio')
-                return {"pnl":trades_analysis.pnl.net.total or 0.0, "total_trades":trades_analysis.total.total,"won_trades":trades_analysis.won.total or 0,"lost_trades":trades_analysis.lost.total or 0,"pnl_won_total":trades_analysis.won.pnl.total or 0.0,"pnl_lost_total":trades_analysis.lost.pnl.total or 0.0,"sqn":analysis.sqn.get_analysis().get('sqn'),"max_drawdown":analysis.drawdown.get_analysis().max.drawdown,"sharpe_ratio":sharpe_ratio if sharpe_ratio is not None else 0.0,}
-        except Exception as e: self.logger.error(f"回測期間發生錯誤: {e}",exc_info=False)
+                sqn_value = analysis.sqn.get_analysis().get('sqn')
+                return {
+                    "pnl": trades_analysis.pnl.net.total or 0.0, 
+                    "total_trades": trades_analysis.total.total,
+                    "won_trades": trades_analysis.won.total or 0,
+                    "lost_trades": trades_analysis.lost.total or 0,
+                    "pnl_won_total": trades_analysis.won.pnl.total or 0.0,
+                    "pnl_lost_total": trades_analysis.lost.pnl.total or 0.0,
+                    "sqn": sqn_value if sqn_value is not None else 0.0,
+                    "max_drawdown": analysis.drawdown.get_analysis().max.drawdown,
+                    "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
+                }
+        except Exception as e: 
+            self.logger.error(f"回測期間發生錯誤: {e}",exc_info=False)
+        
+        # 預設返回零值字典
         return {"pnl":0.0,"total_trades":0,"won_trades":0,"lost_trades":0,"max_drawdown":0.0,"sharpe_ratio":0.0,"pnl_won_total":0.0,"pnl_lost_total":0.0,"sqn":0.0,"profit_factor":0.0}
 
     def run_for_single_market(self, market_file_path: Path):
@@ -202,8 +229,11 @@ class MLOptimizerAndBacktester:
         self.logger.info(f"在 {market_name} 中找到 {len(available_features)}/{len(selected_features)} 個可用專屬特徵。")
         if len(available_features) < 5: self.logger.warning(f"可用特徵過少 (<5)，跳過。"); return
         df = create_triple_barrier_labels(df, self.tb_settings)
-        mapping = {1: 1, -1: 0, 0: 2}; df['target_multiclass'] = df['label'].map(mapping); df.dropna(inplace=True)
+        mapping = {1: 1, -1: 0, 0: 2}; df['target_multiclass'] = df['label'].map(mapping)
+        # ★★★ 修改：在整個 df 上移除 NaN，而不是在迴圈內 ★★★
+        df.dropna(subset=available_features + ['target_multiclass'], inplace=True)
         if df.empty: self.logger.warning(f"數據清洗後為空，跳過。"); return
+            
         start_date, end_date = df.index.min(), df.index.max()
         wfo_days = {k: timedelta(days=self.wfo_config[k]) for k in ['training_days', 'validation_days', 'testing_days', 'step_days']}
         current_date, fold_results, fold_number = start_date, [], 0
@@ -212,37 +242,50 @@ class MLOptimizerAndBacktester:
             fold_number += 1
             train_start, val_start, test_start, test_end = current_date, current_date + wfo_days['training_days'], current_date + wfo_days['training_days'] + wfo_days['validation_days'], current_date + wfo_days['training_days'] + wfo_days['validation_days'] + wfo_days['testing_days']
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
-            df_train, df_val, df_test = df.loc[train_start:val_start], df.loc[val_start:test_start], df.loc[test_start:test_end]
+            
+            df_train, df_val, df_test = df.loc[train_start:val_start-timedelta(seconds=1)], df.loc[val_start:test_start-timedelta(seconds=1)], df.loc[test_start:test_end-timedelta(seconds=1)]
             if any(d.empty for d in [df_train, df_val, df_test]): self.logger.warning("當前窗口數據不足，跳過。"); current_date += wfo_days['step_days']; continue
+            
             X_train, y_train = df_train[available_features], df_train['target_multiclass']
+            
             study = optuna.create_study(direction='maximize')
             study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, available_features, market_name), n_trials=self.wfo_config.get('n_trials', 50), show_progress_bar=True)
-            self.logger.info(f"優化完成！最佳驗證集 SQN: {study.best_value:.4f}"); self.logger.info(f"最佳參數: {study.best_params}") # 修改日誌
+            
+            self.logger.info(f"優化完成！最佳驗證集 SQN: {study.best_value:.4f}"); self.logger.info(f"最佳參數: {study.best_params}")
             params_with_fold = {'fold': fold_number, 'best_sqn_in_val': study.best_value, **study.best_params}; all_fold_best_params.append(params_with_fold)
+
             X_in_sample = pd.concat([df_train[available_features], df_val[available_features]])
             y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
+            
             model_params = {k: v for k, v in study.best_params.items() if k not in self.strategy_params.keys() and k not in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier']}
             model_params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1, 'seed': 42})
+            
             final_model = lgb.LGBMClassifier(**model_params)
             final_model.fit(X_in_sample, y_in_sample)
+            
             final_test_params = self.strategy_params.copy()
             for k in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier']:
                 final_test_params[k] = study.best_params.get(k, self.strategy_params[k])
+            
             result = self.run_backtest_on_fold(df_test, final_model, available_features, final_test_params); fold_results.append(result)
-            win_rate = (result['won_trades'] / result['total_trades'] * 100 if result['total_trades'] > 0 else 0)
-            print(f"Fold {fold_number} 測試結果: PnL={result['pnl']:.2f}, Trades={result['total_trades']}, WinRate={win_rate:.2f}% (使用最佳參數)")
+            win_rate = (result['won_trades'] / result['total_trades'] * 100 if result.get('total_trades', 0) > 0 else 0)
+            print(f"Fold {fold_number} 測試結果: PnL={result.get('pnl', 0.0):.2f}, Trades={result.get('total_trades', 0)}, WinRate={win_rate:.2f}% (使用最佳參數)")
             current_date += wfo_days['step_days']
+        
         params_filename = self.output_base_dir / f"{market_name}_best_params_lgbm.json"
         self._save_json({"market": market_name, "folds_data": all_fold_best_params}, params_filename)
+        
         if not fold_results: self.logger.warning(f"{market_name} 沒有足夠數據完成回測。"); return
-        final_pnl = sum(r['pnl'] for r in fold_results); total_trades = sum(r['total_trades'] for r in fold_results); won_trades = sum(r['won_trades'] for r in fold_results)
-        total_won_pnl = sum(r['pnl_won_total'] for r in fold_results); total_lost_pnl = sum(r['pnl_lost_total'] for r in fold_results)
+            
+        final_pnl = sum(r.get('pnl', 0) for r in fold_results); total_trades = sum(r.get('total_trades', 0) for r in fold_results); won_trades = sum(r.get('won_trades', 0) for r in fold_results)
+        total_won_pnl = sum(r.get('pnl_won_total', 0) for r in fold_results); total_lost_pnl = sum(r.get('pnl_lost_total', 0) for r in fold_results)
         profit_factor = total_won_pnl / abs(total_lost_pnl) if total_lost_pnl != 0 else float('inf')
         win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
-        avg_max_drawdown = np.mean([r['max_drawdown'] for r in fold_results])
-        valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r['sharpe_ratio'] is not None and r['sharpe_ratio'] != 0.0]
+        avg_max_drawdown = np.mean([r.get('max_drawdown', 0) for r in fold_results])
+        valid_sharpes = [r['sharpe_ratio'] for r in fold_results if r.get('sharpe_ratio') is not None and r['sharpe_ratio'] != 0.0]
         avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
         valid_sqns = [r['sqn'] for r in fold_results if r.get('sqn') is not None]; avg_sqn = np.mean(valid_sqns) if valid_sqns else 0.0
+        
         report = (f"\n--- {market_name} (LightGBM) 滾動優化總結報告 ---\n"
                   f"  - 總淨利: {final_pnl:,.2f}\n  - 總交易次數: {total_trades}\n"
                   f"  - 總勝率: {win_rate:.2%}\n  - 獲利因子: {profit_factor:.2f}\n"
@@ -253,7 +296,7 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "profit_factor": profit_factor, "avg_sqn": avg_sqn, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} LightGBM 整合式滾動優化與回測流程開始 (版本 13.2) {'='*25}")
+        self.logger.info(f"{'='*25} LightGBM 整合式滾動優化與回測流程開始 (版本 13.3) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet")); input_files = [f for f in all_files if '_H4.parquet' in f.name]
         self.logger.info(f"已篩選出 {len(input_files)} 個 H4 市場檔案進行回測。")
