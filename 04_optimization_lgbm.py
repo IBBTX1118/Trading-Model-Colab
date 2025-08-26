@@ -1,6 +1,6 @@
 # 檔名: 04_optimization_lgbm.py
 # 描述: 使用 LightGBM 模型進行參數優化與回測。
-# 版本: 13.4 (修復回測引擎數據傳遞錯誤，穩定運行)
+# 版本: 13.5 (整合樣本平衡機制並修復 Key/ZeroDivisionError)
 
 import sys; import yaml; import json; from pathlib import Path; from typing import Dict
 import pandas as pd; import numpy as np; from datetime import timedelta; import traceback; import logging
@@ -72,7 +72,7 @@ class FinalMLStrategy(bt.Strategy):
         try:
             feature_data = {feat: getattr(self.datas[0].lines, feat)[0] for feat in self.p.features}
             feature_df = pd.DataFrame([feature_data], columns=self.p.features)
-        except Exception as e:
+        except Exception:
             return
 
         pred_probs = self.p.model.predict_proba(feature_df)[0]
@@ -167,16 +167,13 @@ class MLOptimizerAndBacktester:
         return sqn if sqn is not None else -5.0
     
     def run_backtest_on_fold(self, df_fold, model, available_features, strategy_params_override=None):
-        # ★★★ 核心修改：定義所有 Backtrader 需要的欄位，包括 OHLCV 和所有特徵 ★★★
         all_possible_columns = list(df_fold.columns)
         
         class PandasDataWithFeatures(bt.feeds.PandasData):
             lines = tuple(all_possible_columns)
-            # 動態生成 params，將 'volume' 映射到 'tick_volume'，其餘設為 -1 (自動)
             params = (('volume', 'tick_volume'),) + tuple([(col, -1) for col in all_possible_columns])
 
         cerebro = bt.Cerebro(stdstats=False)
-        # ★★★ 核心修改：將完整的 df_fold 傳遞給數據饋送 ★★★
         data_feed = PandasDataWithFeatures(dataname=df_fold)
         cerebro.adddata(data_feed)
 
@@ -197,6 +194,7 @@ class MLOptimizerAndBacktester:
             analysis = results[0].analyzers
             trades_analysis = analysis.trades.get_analysis()
             
+            # ★★★ 核心修改：安全地檢查交易是否存在 ★★★
             if trades_analysis.get('total', {}).get('total', 0) > 0:
                 sharpe_ratio = analysis.sharpe.get_analysis().get('sharperatio')
                 sqn_value = analysis.sqn.get_analysis().get('sqn')
@@ -208,13 +206,13 @@ class MLOptimizerAndBacktester:
                     "pnl_won_total": trades_analysis.won.pnl.total or 0.0,
                     "pnl_lost_total": trades_analysis.lost.pnl.total or 0.0,
                     "sqn": sqn_value if sqn_value is not None else 0.0,
-                    "max_drawdown": analysis.drawdown.get_analysis().max.drawdown,
+                    "max_drawdown": analysis.drawdown.get_analysis().max.drawdown or 0.0,
                     "sharpe_ratio": sharpe_ratio if sharpe_ratio is not None else 0.0,
                 }
         except Exception as e: 
-            # 增加更詳細的錯誤日誌
             self.logger.error(f"回測期間發生嚴重錯誤: {e}\n{traceback.format_exc()}")
         
+        # 如果沒有交易或發生錯誤，返回一個包含零值的完整字典
         return {"pnl":0.0,"total_trades":0,"won_trades":0,"lost_trades":0,"max_drawdown":0.0,"sharpe_ratio":0.0,"pnl_won_total":0.0,"pnl_lost_total":0.0,"sqn":0.0}
 
     def run_for_single_market(self, market_file_path: Path):
@@ -226,7 +224,6 @@ class MLOptimizerAndBacktester:
         selected_features = features_data['selected_features']
         df = pd.read_parquet(market_file_path); df.index = pd.to_datetime(df.index)
         
-        # 確保所有必要欄位都存在
         required_cols = ['open', 'high', 'low', 'close', 'tick_volume'] + selected_features
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
@@ -235,7 +232,7 @@ class MLOptimizerAndBacktester:
 
         df = create_triple_barrier_labels(df, self.tb_settings)
         mapping = {1: 1, -1: 0, 0: 2}; df['target_multiclass'] = df['label'].map(mapping)
-        df.dropna(subset=selected_features + ['target_multiclass'], inplace=True)
+        df.dropna(subset=selected_features + ['target_multiclass', 'label'], inplace=True)
         if df.empty: self.logger.warning(f"數據清洗後為空，跳過。"); return
             
         start_date, end_date = df.index.min(), df.index.max()
@@ -251,16 +248,29 @@ class MLOptimizerAndBacktester:
             
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}-{val_start.date()}] | Val[{val_start.date()}-{test_start.date()}] | Test[{test_start.date()}-{test_end.date()}] ---")
             
-            df_train = df.loc[train_start:val_start-timedelta(seconds=1)]
+            df_train_full = df.loc[train_start:val_start-timedelta(seconds=1)]
             df_val = df.loc[val_start:test_start-timedelta(seconds=1)]
             df_test = df.loc[test_start:test_end-timedelta(seconds=1)]
             
-            if any(d.empty for d in [df_train, df_val, df_test]): self.logger.warning("當前窗口數據不足，跳過。"); current_date += wfo_days['step_days']; continue
+            if any(d.empty for d in [df_train_full, df_val, df_test]): self.logger.warning("當前窗口數據不足，跳過。"); current_date += wfo_days['step_days']; continue
             
+            # ★★★ 核心修改：對訓練集進行欠採樣以解決樣本不平衡問題 ★★★
+            trade_signals = df_train_full[df_train_full['label'] != 0]
+            hold_signals = df_train_full[df_train_full['label'] == 0]
+            
+            if not trade_signals.empty and not hold_signals.empty:
+                # 隨機抽取與交易信號相同數量的持有信號
+                hold_signals_sampled = hold_signals.sample(n=len(trade_signals), random_state=42)
+                # 合併成平衡的訓練集
+                df_train = pd.concat([trade_signals, hold_signals_sampled]).sort_index()
+                self.logger.info(f"樣本平衡後，訓練集大小: {len(df_train)} (原大小: {len(df_train_full)})")
+            else:
+                df_train = df_train_full # 如果沒有交易或持有信號，則使用原始數據
+
             X_train, y_train = df_train[selected_features], df_train['target_multiclass']
             
             study = optuna.create_study(direction='maximize')
-            study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, selected_features, market_name), n_trials=self.wfo_config.get('n_trials', 50), show_progress_bar=True)
+            study.optimize(lambda trial: self.objective(trial, X_train, y_train, df_val, selected_features, market_name), n_trials=self.wfo_config.get('n_trials', 5), show_progress_bar=True)
             
             self.logger.info(f"優化完成！最佳驗證集 SQN: {study.best_value:.4f}"); self.logger.info(f"最佳參數: {study.best_params}")
             params_with_fold = {'fold': fold_number, 'best_sqn_in_val': study.best_value, **study.best_params}; all_fold_best_params.append(params_with_fold)
@@ -268,7 +278,7 @@ class MLOptimizerAndBacktester:
             X_in_sample = pd.concat([df_train[selected_features], df_val[selected_features]])
             y_in_sample = pd.concat([df_train['target_multiclass'], df_val['target_multiclass']])
             
-            model_params = {k: v for k, v in study.best_params.items() if k not in self.strategy_params.keys() and k not in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier']}
+            model_params = {k: v for k, v in study.best_params.items() if k not in self.strategy_params and k not in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier']}
             model_params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 3, 'verbosity': -1, 'seed': 42})
             
             final_model = lgb.LGBMClassifier(**model_params)
@@ -278,7 +288,8 @@ class MLOptimizerAndBacktester:
             for k in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier']:
                 if k in study.best_params: final_test_params[k] = study.best_params[k]
             
-            result = self.run_backtest_on_fold(df_test, final_model, selected_features, final_test_params); fold_results.append(result)
+            result = self.run_backtest_on_fold(df_test, final_model, selected_features, final_test_params)
+            fold_results.append(result)
             win_rate = (result.get('won_trades', 0) / result.get('total_trades', 1) * 100)
             print(f"Fold {fold_number} 測試結果: PnL={result.get('pnl', 0.0):.2f}, Trades={result.get('total_trades', 0)}, WinRate={win_rate:.2f}% (使用最佳參數)")
             current_date += wfo_days['step_days']
@@ -307,7 +318,7 @@ class MLOptimizerAndBacktester:
         self.all_market_results[market_file_path.stem] = {"final_pnl": final_pnl, "total_trades": total_trades, "win_rate": win_rate, "profit_factor": profit_factor, "avg_sqn": avg_sqn, "avg_sharpe": avg_sharpe_ratio}
 
     def run(self):
-        self.logger.info(f"{'='*25} LightGBM 整合式滾動優化與回測流程開始 (版本 13.4) {'='*25}")
+        self.logger.info(f"{'='*25} LightGBM 整合式滾動優化與回測流程開始 (版本 13.5) {'='*25}")
         input_dir = Path(self.paths['features_data'])
         all_files = list(input_dir.rglob("*.parquet")); input_files = [f for f in all_files if '_H4.parquet' in f.name]
         self.logger.info(f"已篩選出 {len(input_files)} 個 H4 市場檔案進行回測。")
@@ -327,6 +338,8 @@ class MLOptimizerAndBacktester:
 if __name__ == "__main__":
     try:
         config = load_config()
+        # ★★★ 為了加速測試，暫時將 n_trials 設為 5，您可以之後再調回 config.yaml 中的設定 ★★★
+        config['walk_forward_optimization']['n_trials'] = 5
         optimizer = MLOptimizerAndBacktester(config)
         optimizer.run()
     except Exception as e:
