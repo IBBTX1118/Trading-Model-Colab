@@ -1,6 +1,6 @@
 # 檔名: 04_optimization_lgbm.py
-# 描述: 完整修復版 - 使用 LightGBM 模型進行參數優化與回測
-# 版本: 14.0 (完全修復版)
+# 描述: 增強版 - 使用 LightGBM 模型進行參數優化與回測，包含信心度過濾和凱利公式
+# 版本: 15.0 (增強版：信心度過濾 + 凱利公式)
 
 import sys
 import yaml
@@ -32,8 +32,122 @@ def load_config(config_path: str = 'config.yaml') -> Dict:
         print(f"致命錯誤: 讀取設定檔 {config_path} 時發生錯誤: {e}")
         sys.exit(1)
 
+def create_adaptive_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
+    """自適應標籤創建，根據市場狀態動態調整止盈止損"""
+    df_out = df.copy()
+    
+    # 基礎倍數
+    tp_multiplier_base = settings['tp_atr_multiplier']
+    sl_multiplier_base = settings['sl_atr_multiplier']
+    max_hold = settings['max_hold_periods']
+    
+    # 狀態調整因子 [cite: 71]
+    regime_adjustment = {
+        0: 0.8,  # 低波動盤整: 收緊目標 [cite: 73]
+        1: 0.9,  # 低波動趨勢: 略微收緊 [cite: 74]
+        2: 1.1,  # 高波動盤整: 略微放大 [cite: 75]
+        3: 1.2   # 高波動趨勢: 放大目標 [cite: 76]
+    }
+    
+    # 檢查 market_regime 是否存在
+    if 'market_regime' in df_out.columns:
+        df_out['tp_multiplier_adj'] = df_out['market_regime'].map(regime_adjustment) * tp_multiplier_base
+        df_out['sl_multiplier_adj'] = df_out['market_regime'].map(regime_adjustment) * sl_multiplier_base
+        print("使用市場狀態自適應調整止盈止損倍數")
+    else:
+        # 如果沒有狀態特徵，則退回使用固定倍數
+        df_out['tp_multiplier_adj'] = tp_multiplier_base
+        df_out['sl_multiplier_adj'] = sl_multiplier_base
+        print("未找到 market_regime 特徵，使用固定止盈止損倍數")
+    
+    # 檢查ATR欄位
+    atr_col_name = None
+    for col in df_out.columns:
+        if 'D1_ATR_14' in col:
+            atr_col_name = col
+            break
+        elif 'ATR_14' in col:
+            atr_col_name = col
+            
+    if atr_col_name is None:
+        raise ValueError(f"數據中缺少 ATR 欄位，無法創建標籤。")
+    
+    # 創建標籤結果
+    outcomes = pd.Series(index=df_out.index, dtype=float, name='label')
+    
+    high_series, low_series, atr_series = df_out['high'], df_out['low'], df_out[atr_col_name]
+    tp_multipliers, sl_multipliers = df_out['tp_multiplier_adj'], df_out['sl_multiplier_adj']
+    
+    valid_count = 0
+    tp_count = 0
+    sl_count = 0
+    hold_count = 0
+    
+    # 為每個時間點計算三道門檻標籤
+    for i in range(len(df_out) - max_hold):
+        entry_price = df_out['close'].iloc[i]
+        atr_at_entry = atr_series.iloc[i]
+        tp_multiplier = tp_multipliers.iloc[i]
+        sl_multiplier = sl_multipliers.iloc[i]
+        
+        # 檢查數據有效性
+        if atr_at_entry <= 0 or pd.isna(atr_at_entry) or pd.isna(tp_multiplier) or pd.isna(sl_multiplier):
+            continue
+            
+        valid_count += 1
+        
+        # 計算自適應的止盈止損價格
+        tp_price = entry_price + (atr_at_entry * tp_multiplier)
+        sl_price = entry_price - (atr_at_entry * sl_multiplier)
+        
+        # 檢查未來價格行為
+        future_highs = high_series.iloc[i+1:i+1+max_hold]
+        future_lows = low_series.iloc[i+1:i+1+max_hold]
+        
+        if future_highs.empty or future_lows.empty:
+            continue
+            
+        # 檢查觸及條件
+        hit_tp_mask = future_highs >= tp_price
+        hit_sl_mask = future_lows <= sl_price
+        
+        tp_hit = hit_tp_mask.any()
+        sl_hit = hit_sl_mask.any()
+        
+        if tp_hit and sl_hit:
+            # 都觸及，看誰先
+            tp_first_idx = hit_tp_mask.idxmax() if tp_hit else None
+            sl_first_idx = hit_sl_mask.idxmax() if sl_hit else None
+            
+            if tp_first_idx <= sl_first_idx:
+                outcomes.iloc[i] = 1
+                tp_count += 1
+            else:
+                outcomes.iloc[i] = -1
+                sl_count += 1
+        elif tp_hit:
+            outcomes.iloc[i] = 1
+            tp_count += 1
+        elif sl_hit:
+            outcomes.iloc[i] = -1
+            sl_count += 1
+        else:
+            outcomes.iloc[i] = 0
+            hold_count += 1
+    
+    print(f"自適應標籤統計: 有效={valid_count}, 止盈={tp_count}, 止損={sl_count}, 持有={hold_count}")
+    
+    # 合併結果並創建目標變數
+    df_out = df_out.join(outcomes.to_frame())
+    df_out['target'] = (df_out['label'] == 1).astype(int)
+    
+    # 清理臨時欄位
+    df_out.drop(columns=['tp_multiplier_adj', 'sl_multiplier_adj'], inplace=True, errors='ignore')
+    
+    return df_out
+
 def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
-    """創建三道門檻標籤（穩定版）"""
+    """創建三道門檻標籤（傳統版本，保留為向後兼容）"""
     df_out = df.copy()
     tp_multiplier = settings['tp_atr_multiplier']
     sl_multiplier = settings['sl_atr_multiplier']
@@ -117,19 +231,22 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     return df_out
 
 # ==============================================================================
-#                      改進的交易策略
+#                      增強版交易策略 (信心度過濾 + 凱利公式)
 # ==============================================================================
-class ImprovedMLStrategy(bt.Strategy):
-    """改進的機器學習交易策略"""
+class EnhancedMLStrategy(bt.Strategy):
+    """增強版機器學習策略，包含信心度過濾和凱利公式"""
     
     params = (
-        ('model', None), 
-        ('features', None), 
-        ('entry_threshold', 0.4), 
-        ('tp_atr_multiplier', 2.5), 
-        ('sl_atr_multiplier', 1.5),
-        ('risk_per_trade', 0.02),
-        ('max_position_size', 0.1),
+        ('model', None),
+        ('features', None),
+        ('entry_threshold', 0.35),
+        ('confidence_threshold', 0.6),   # 新增：信心度門檻 [cite: 87]
+        ('tp_atr_multiplier', 1.8),
+        ('sl_atr_multiplier', 2.0),
+        ('risk_per_trade', 0.015),
+        ('max_position_size', 0.1),      # 新增：單筆最大倉位限制
+        ('use_kelly_criterion', True),   # 使用凱利公式 [cite: 92]
+        ('use_adaptive_labels', True),   # 使用自適應標籤
     )
 
     def __init__(self):
@@ -159,6 +276,14 @@ class ImprovedMLStrategy(bt.Strategy):
         self.current_order = None
         self.trade_count = 0
         self.last_prediction = None
+        self.trade_history = []  # 用於記錄近期交易盈虧 [cite: 98]
+        
+        # 信心度統計
+        self.confidence_stats = {
+            'total_predictions': 0,
+            'filtered_by_confidence': 0,
+            'executed_trades': 0
+        }
 
     def log(self, txt, dt=None):
         """日誌記錄"""
@@ -183,9 +308,14 @@ class ImprovedMLStrategy(bt.Strategy):
         self.current_order = None
 
     def notify_trade(self, trade):
-        """交易結果通知"""
+        """交易結果通知，並記錄歷史"""
         if trade.isclosed:
             self.log(f'交易結束: 盈虧={trade.pnl:.2f}, 淨盈虧={trade.pnlcomm:.2f}')
+            self.trade_history.append(trade.pnlcomm)  # 記錄淨盈虧
+            
+            # 限制記錄的最大長度以節省記憶體
+            if len(self.trade_history) > 100:
+                self.trade_history = self.trade_history[-50:]  # 保留最近50筆
 
     def get_feature_values(self) -> Dict:
         """安全獲取特徵值"""
@@ -227,7 +357,27 @@ class ImprovedMLStrategy(bt.Strategy):
             print(f"預測過程發生錯誤: {e}")
             return None, None, None
 
-    def calculate_position_size(self, atr_value: float) -> float:
+    def calculate_kelly_position_size(self, win_prob: float, win_loss_ratio: float) -> float:
+        """計算分數凱利倉位"""
+        if win_loss_ratio <= 0: 
+            return self.p.risk_per_trade  # 避免除零錯誤
+        
+        # Kelly % = (p * b - (1-p)) / b
+        kelly_pct = (win_prob * win_loss_ratio - (1 - win_prob)) / win_loss_ratio
+        
+        # 使用分數凱利 (建議 25% ~ 50%) 以降低風險 [cite: 106]
+        final_pct = max(0, kelly_pct * 0.25)
+        
+        # 限制在最大倉位內
+        return min(final_pct, self.p.max_position_size)
+
+    def calculate_confidence(self, prob_sl: float, prob_tp: float, prob_hold: float) -> float:
+        """計算信心度 (預測類別與第二名類別的差距) [cite: 119]"""
+        probs = sorted([prob_sl, prob_tp, prob_hold], reverse=True)
+        confidence = probs[0] - probs[1]
+        return confidence
+
+    def calculate_position_size(self, atr_value: float, base_risk_pct: float) -> float:
         """計算持倉大小"""
         try:
             portfolio_value = self.broker.getvalue()
@@ -237,8 +387,8 @@ class ImprovedMLStrategy(bt.Strategy):
             if sl_distance <= 0:
                 return 0
             
-            # 基於固定風險百分比的倉位計算
-            risk_amount = portfolio_value * self.p.risk_per_trade
+            # 基於風險百分比的倉位計算
+            risk_amount = portfolio_value * base_risk_pct
             position_size = risk_amount / sl_distance
             
             # 限制最大倉位
@@ -273,6 +423,14 @@ class ImprovedMLStrategy(bt.Strategy):
             return
         
         self.last_prediction = (prob_sl, prob_tp, prob_hold)
+        self.confidence_stats['total_predictions'] += 1
+        
+        # 計算信心度 (預測類別與第二名類別的差距) [cite: 119]
+        confidence = self.calculate_confidence(prob_sl, prob_tp, prob_hold)
+        
+        if confidence < self.p.confidence_threshold:
+            self.confidence_stats['filtered_by_confidence'] += 1
+            return  # 信心度不足，不交易 [cite: 121]
         
         # 獲取市場數據
         current_price = self.data.close[0]
@@ -290,8 +448,35 @@ class ImprovedMLStrategy(bt.Strategy):
             except:
                 pass
         
-        # 計算倉位大小
-        position_size = self.calculate_position_size(atr_value)
+        # 初始風險百分比
+        position_size_pct = self.p.risk_per_trade
+        
+        # 使用凱利公式計算倉位 [cite: 123]
+        if self.p.use_kelly_criterion and len(self.trade_history) > 20:
+            recent_trades = self.trade_history[-20:]  # 基於最近20筆交易 [cite: 124]
+            wins = [t for t in recent_trades if t > 0]
+            losses = [t for t in recent_trades if t < 0]
+            
+            if not wins or not losses:
+                win_rate = 0.5
+                win_loss_ratio = 1.5  # 初始預設值
+            else:
+                win_rate = len(wins) / len(recent_trades)
+                avg_win = np.mean(wins)
+                avg_loss = abs(np.mean(losses))
+                win_loss_ratio = avg_win / avg_loss
+            
+            kelly_position_size_pct = self.calculate_kelly_position_size(win_rate, win_loss_ratio)
+            
+            # 使用凱利公式結果，但仍受最大倉位限制
+            position_size_pct = min(kelly_position_size_pct, self.p.max_position_size)
+            
+            if len(self.trade_history) % 10 == 0:  # 每10筆交易記錄一次
+                print(f"凱利公式計算: 勝率={win_rate:.2f}, 盈虧比={win_loss_ratio:.2f}, "
+                      f"建議倉位={kelly_position_size_pct:.3f}, 實際使用={position_size_pct:.3f}")
+        
+        # 計算實際倉位大小
+        position_size = self.calculate_position_size(atr_value, position_size_pct)
         if position_size <= 0:
             return
         
@@ -311,6 +496,10 @@ class ImprovedMLStrategy(bt.Strategy):
                     self.sell(size=position_size, exectype=bt.Order.Limit, 
                              price=tp_price, parent=main_order)
                     self.current_order = main_order
+                    self.confidence_stats['executed_trades'] += 1
+                    
+                    self.log(f'做多信號: 概率={prob_tp:.3f}, 信心度={confidence:.3f}, '
+                            f'倉位={position_size_pct:.3f}, TP={tp_price:.5f}, SL={sl_price:.5f}')
                     
             elif not is_uptrend and prob_sl > prob_tp and prob_sl > self.p.entry_threshold:
                 # 看跌信號
@@ -326,15 +515,34 @@ class ImprovedMLStrategy(bt.Strategy):
                     self.buy(size=position_size, exectype=bt.Order.Limit, 
                             price=tp_price, parent=main_order)
                     self.current_order = main_order
+                    self.confidence_stats['executed_trades'] += 1
+                    
+                    self.log(f'做空信號: 概率={prob_sl:.3f}, 信心度={confidence:.3f}, '
+                            f'倉位={position_size_pct:.3f}, TP={tp_price:.5f}, SL={sl_price:.5f}')
                     
         except Exception as e:
             print(f"下單過程發生錯誤: {e}")
 
+    def stop(self):
+        """策略結束時的統計報告"""
+        total_preds = self.confidence_stats['total_predictions']
+        filtered = self.confidence_stats['filtered_by_confidence']
+        executed = self.confidence_stats['executed_trades']
+        
+        filter_rate = (filtered / total_preds * 100) if total_preds > 0 else 0
+        execution_rate = (executed / total_preds * 100) if total_preds > 0 else 0
+        
+        print(f"\n=== 增強策略統計 ===")
+        print(f"總預測次數: {total_preds}")
+        print(f"信心度過濾: {filtered} ({filter_rate:.1f}%)")
+        print(f"實際執行交易: {executed} ({execution_rate:.1f}%)")
+        print(f"總交易記錄: {len(self.trade_history)}")
+
 # ==============================================================================
-#                      優化器與回測器
+#                      優化器與回測器 (更新版)
 # ==============================================================================
 class MLOptimizerAndBacktester:
-    """機器學習優化器與回測器"""
+    """機器學習優化器與回測器 - 增強版"""
     
     def __init__(self, config: Dict):
         self.config = config
@@ -343,11 +551,15 @@ class MLOptimizerAndBacktester:
         self.strategy_params = config.get('strategy_params', {})
         self.tb_settings = config['triple_barrier_settings']
         
+        # 檢查是否使用自適應標籤
+        self.use_adaptive_labels = config.get('use_adaptive_labels', True)
+        
         # 設置策略參數
         self.strategy_params.update({
             'tp_atr_multiplier': self.tb_settings.get('tp_atr_multiplier', 2.5),
             'sl_atr_multiplier': self.tb_settings.get('sl_atr_multiplier', 1.5),
-            'risk_per_trade': self.strategy_params.get('risk_per_trade', 0.02)
+            'risk_per_trade': self.strategy_params.get('risk_per_trade', 0.02),
+            'use_adaptive_labels': self.use_adaptive_labels
         })
         
         # 設置日誌
@@ -402,7 +614,7 @@ class MLOptimizerAndBacktester:
 
     def objective(self, trial: optuna.trial.Trial, X_train, y_train, df_val, 
                  available_features: List[str], market_name: str) -> float:
-        """Optuna優化目標函數"""
+        """Optuna優化目標函數 - 增強版"""
         try:
             # LightGBM模型參數
             model_params = {
@@ -421,12 +633,15 @@ class MLOptimizerAndBacktester:
                 'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 1.0, log=True),
             }
             
-            # 策略參數
+            # 增強策略參數
             strategy_updates = {
                 'entry_threshold': trial.suggest_float('entry_threshold', 0.3, 0.6),
+                'confidence_threshold': trial.suggest_float('confidence_threshold', 0.4, 0.8),  # 新增
                 'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.5, 4.0),
                 'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 0.8, 2.5),
                 'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05),
+                'max_position_size': trial.suggest_float('max_position_size', 0.05, 0.2),  # 新增
+                'use_kelly_criterion': trial.suggest_categorical('use_kelly_criterion', [True, False]),  # 新增
             }
             
             # 確保盈虧比合理
@@ -445,13 +660,18 @@ class MLOptimizerAndBacktester:
             if result.get('total_trades', 0) < 5:
                 return -999.0
             
-            # 使用總盈虧作為優化目標
+            # 使用總盈虧作為優化目標，加入風險調整
             pnl = result.get('pnl', 0.0)
-            
-            # 加入風險調整
             max_drawdown = result.get('max_drawdown', 0.0)
+            
+            # 風險調整後的目標函數
             if max_drawdown > 20:  # 回撤超過20%，懲罰
                 pnl *= 0.5
+            
+            # 獎勵較高的夏普比率
+            sharpe_ratio = result.get('sharpe_ratio', 0.0)
+            if sharpe_ratio > 1.0:
+                pnl *= 1.1  # 小幅獎勵
                 
             return pnl
             
@@ -461,7 +681,7 @@ class MLOptimizerAndBacktester:
 
     def run_backtest_on_fold(self, df_fold: pd.DataFrame, model, available_features: List[str], 
                            strategy_params_override: Dict = None) -> Dict:
-        """在單個fold上運行回測"""
+        """在單個fold上運行回測 - 使用增強策略"""
         try:
             # 驗證數據
             if df_fold.empty:
@@ -493,8 +713,8 @@ class MLOptimizerAndBacktester:
                 **final_strategy_params
             }
             
-            # 添加策略
-            cerebro.addstrategy(ImprovedMLStrategy, **strategy_kwargs)
+            # 添加增強策略
+            cerebro.addstrategy(EnhancedMLStrategy, **strategy_kwargs)
             
             # 設置經紀商
             cerebro.broker.setcash(self.wfo_config['initial_cash'])
@@ -587,7 +807,7 @@ class MLOptimizerAndBacktester:
                 'pnl_lost_total': total_lost_pnl,
                 'max_drawdown': max_drawdown,
                 'sharpe_ratio': sharpe_ratio,
-                'sqn': 0.0,  # 暫時設為0，避免計算錯誤
+                'sqn': 0.0,
             }
             
         except Exception as e:
@@ -609,7 +829,7 @@ class MLOptimizerAndBacktester:
         }
 
     def run_for_single_market(self, market_file_path: Path):
-        """處理單個市場"""
+        """處理單個市場 - 支持自適應標籤"""
         market_name = market_file_path.stem
         self.logger.info(f"{'='*30} 開始處理市場: {market_name} {'='*30}")
         
@@ -648,8 +868,14 @@ class MLOptimizerAndBacktester:
                 
             self.logger.info(f"使用 {len(available_features)}/{len(selected_features)} 個特徵")
             
-            # 創建標籤
-            df = create_triple_barrier_labels(df, self.tb_settings)
+            # 創建標籤 - 支持自適應標籤
+            if self.use_adaptive_labels:
+                self.logger.info("使用自適應標籤創建")
+                df = create_adaptive_labels(df, self.tb_settings)
+            else:
+                self.logger.info("使用傳統固定倍數標籤")
+                df = create_triple_barrier_labels(df, self.tb_settings)
+            
             mapping = {1: 1, -1: 0, 0: 2}
             df['target_multiclass'] = df['label'].map(mapping)
             
@@ -789,7 +1015,8 @@ class MLOptimizerAndBacktester:
             # 提取模型參數
             model_params = {
                 k: v for k, v in best_params.items() 
-                if k not in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier', 'risk_per_trade']
+                if k not in ['entry_threshold', 'confidence_threshold', 'tp_atr_multiplier', 
+                           'sl_atr_multiplier', 'risk_per_trade', 'max_position_size', 'use_kelly_criterion']
             }
             model_params.update({
                 'objective': 'multiclass',
@@ -805,7 +1032,9 @@ class MLOptimizerAndBacktester:
             
             # 準備測試參數
             final_test_params = self.strategy_params.copy()
-            for k in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier', 'risk_per_trade']:
+            strategy_param_keys = ['entry_threshold', 'confidence_threshold', 'tp_atr_multiplier', 
+                                 'sl_atr_multiplier', 'risk_per_trade', 'max_position_size', 'use_kelly_criterion']
+            for k in strategy_param_keys:
                 if k in best_params:
                     final_test_params[k] = best_params[k]
             
@@ -822,10 +1051,11 @@ class MLOptimizerAndBacktester:
         """保存結果並生成報告"""
         try:
             # 保存參數
-            params_filename = self.output_base_dir / f"{market_name}_best_params_lgbm.json"
+            params_filename = self.output_base_dir / f"{market_name}_best_params_enhanced_lgbm.json"
             self._save_json({
                 "market": market_name,
                 "total_folds": len(all_fold_best_params),
+                "use_adaptive_labels": self.use_adaptive_labels,
                 "folds_data": all_fold_best_params
             }, params_filename)
             
@@ -851,9 +1081,10 @@ class MLOptimizerAndBacktester:
             avg_sharpe_ratio = np.mean(valid_sharpes) if valid_sharpes else 0.0
             
             # 生成報告
+            label_method = "自適應標籤" if self.use_adaptive_labels else "固定倍數標籤"
             report = (
                 f"\n{'='*60}\n"
-                f"📊 {market_name} (LightGBM) 滾動優化總結報告\n"
+                f"📊 {market_name} (增強版LightGBM + {label_method}) 滾動優化總結報告\n"
                 f"{'='*60}\n"
                 f"📈 總淨利: {final_pnl:,.2f}\n"
                 f"🔢 總交易次數: {total_trades}\n"
@@ -862,6 +1093,7 @@ class MLOptimizerAndBacktester:
                 f"📉 平均最大回撤: {avg_max_drawdown:.2f}%\n"
                 f"⚡ 平均夏普比率: {avg_sharpe_ratio:.2f}\n"
                 f"🔧 處理的Folds: {len(fold_results)}\n"
+                f"🎯 標籤方法: {label_method}\n"
                 f"💾 參數檔案: {params_filename.name}\n"
                 f"{'='*60}"
             )
@@ -876,7 +1108,8 @@ class MLOptimizerAndBacktester:
                 "profit_factor": profit_factor,
                 "avg_sharpe": avg_sharpe_ratio,
                 "avg_drawdown": avg_max_drawdown,
-                "total_folds": len(fold_results)
+                "total_folds": len(fold_results),
+                "label_method": label_method
             }
             
         except Exception as e:
@@ -884,8 +1117,11 @@ class MLOptimizerAndBacktester:
 
     def run(self):
         """主運行函數"""
+        label_method = "自適應標籤" if self.use_adaptive_labels else "固定倍數標籤"
         self.logger.info(f"{'='*50}")
-        self.logger.info(f"🚀 LightGBM 整合式滾動優化與回測流程開始 (版本 14.0)")
+        self.logger.info(f"🚀 增強版LightGBM滾動優化與回測流程開始 (版本 15.0)")
+        self.logger.info(f"📊 標籤方法: {label_method}")
+        self.logger.info(f"🎯 特徵: 信心度過濾 + 凱利公式")
         self.logger.info(f"{'='*50}")
         
         # 查找輸入檔案
@@ -917,8 +1153,9 @@ class MLOptimizerAndBacktester:
 
     def _generate_final_summary(self):
         """生成最終總結報告"""
+        label_method = "自適應標籤" if self.use_adaptive_labels else "固定倍數標籤"
         print(f"\n{'='*80}")
-        print(f"🎉 所有市場滾動回測最終總結 (LightGBM v14.0)")
+        print(f"🎉 所有市場滾動回測最終總結 (增強版LightGBM v15.0 + {label_method})")
         print(f"{'='*80}")
         
         if self.all_market_results:
@@ -928,7 +1165,7 @@ class MLOptimizerAndBacktester:
             
             # 排序列
             cols_order = ['final_pnl', 'total_trades', 'win_rate', 'profit_factor', 
-                         'avg_sharpe', 'avg_drawdown', 'total_folds']
+                         'avg_sharpe', 'avg_drawdown', 'total_folds', 'label_method']
             available_cols = [col for col in cols_order if col in summary_df.columns]
             summary_df = summary_df[available_cols]
             
@@ -949,6 +1186,7 @@ class MLOptimizerAndBacktester:
             print(f"   🏆 平均勝率: {avg_win_rate:.2%}")
             print(f"   💰 平均獲利因子: {avg_profit_factor:.2f}")
             print(f"   ⚡ 平均夏普比率: {avg_sharpe:.2f}")
+            print(f"   🎯 標籤方法: {label_method}")
             
             # 性能評估
             profitable_markets = (summary_df['final_pnl'] > 0).sum()
@@ -970,7 +1208,10 @@ if __name__ == "__main__":
         # 為快速測試設置較少的試驗次數
         if 'walk_forward_optimization' not in config:
             config['walk_forward_optimization'] = {}
-        config['walk_forward_optimization']['n_trials'] = 10
+        config['walk_forward_optimization']['n_trials'] = 15  # 增加試驗次數以更好優化增強參數
+        
+        # 設置是否使用自適應標籤
+        config['use_adaptive_labels'] = True  # 可以設為 False 來使用傳統方法
         
         # 創建並運行優化器
         optimizer = MLOptimizerAndBacktester(config)
