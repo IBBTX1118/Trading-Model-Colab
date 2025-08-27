@@ -28,13 +28,13 @@ feature_selection:
 # --- 動態三道門檻標籤法設定 (ATR-Based) ---
 # 這是目前策略的核心定義，同時被 03 和 04 腳本使用
 triple_barrier_settings:
-  tp_atr_multiplier: 2.5      # 停利目標倍數 (Optuna 會在此基礎上尋找最優值)
-  sl_atr_multiplier: 1.5      # 停損目標倍數 (Optuna 會在此基礎上尋找最優值)
-  max_hold_periods: 20        # 最長持倉 K 棒數 (20根H4 K棒 = 80小時)
+  tp_atr_multiplier: 1.8      # [優化] 降低止盈門檻，從 2.5 -> 1.8，提高獲利機會
+  sl_atr_multiplier: 2.0      # [優化] 增加止損空間，從 1.5 -> 2.0，減少誤判出場
+  max_hold_periods: 30        # [優化] 延長觀察期，從 20 -> 30 (30根H4 K棒 = 120小時)
 
 # --- 滾動優化與回測設定 (已為 H4 數據調整) ---
 walk_forward_optimization:
-  n_trials: 5
+  n_trials: 30                # [優化] 增加 Optuna 試驗次數，從 5 -> 30，進行更充分的參數搜索
   training_days: 270
   validation_days: 90
   testing_days: 45
@@ -44,5 +44,5 @@ walk_forward_optimization:
 
 # --- 交易策略參數 ---
 strategy_params:
-  entry_threshold: 0.45
-  risk_per_trade: 0.01  # ★★★ 確保此行已新增：每筆交易風險佔總資金的 1% ★★★
+  entry_threshold: 0.35       # [優化] 降低基礎入場門檻，從 0.45 -> 0.35，增加交易機會
+  risk_per_trade: 0.015       # [優化] 稍微增加基礎風險，從 0.01 -> 0.015，提升潛在收益
