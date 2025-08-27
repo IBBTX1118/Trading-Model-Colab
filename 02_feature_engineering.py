@@ -1,6 +1,6 @@
 # 檔名: 02_feature_engineering.py
-# 版本: 5.9 (大幅增強特徵工程)
-# 描述: 整合多週期、跨頻率、互動以及宏觀事件、全局因子與多維度高級特徵。
+# 版本: 6.0 (新增市場微結構與市場狀態識別特徵)
+# 描述: 整合多週期、跨頻率、互動以及宏觀事件、全局因子與多維度高級特徵，並新增市場微結構與狀態識別功能。
 
 import logging
 import sys
@@ -26,7 +26,6 @@ class FeatureEngineer:
         self.config.OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _setup_logger(self) -> logging.Logger:
-        # ... 此函數無變動 ...
         logger = logging.getLogger(self.__class__.__name__)
         logger.setLevel(self.config.LOG_LEVEL.upper())
         if not logger.hasHandlers():
@@ -37,8 +36,8 @@ class FeatureEngineer:
         return logger
         
     def _add_global_factor_features(self, df: pd.DataFrame, factors_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-        # ... 此函數無變動 ...
-        if factors_df is None or factors_df.empty: return df
+        if factors_df is None or factors_df.empty: 
+            return df
         df_merged = pd.merge_asof(df.sort_index(), factors_df, left_index=True, right_index=True, direction='backward')
         if 'DXY_close' in df_merged.columns:
             df_merged['DXY_return_1d'] = df_merged['DXY_close'].pct_change(periods=1)
@@ -54,36 +53,112 @@ class FeatureEngineer:
         df_finta = df.copy()
         df_finta.rename(columns={'tick_volume': 'volume'}, inplace=True)
         
-        # ★★★ 修改：增加更多週期的 ATR 計算，供進階特徵使用 ★★★
+        # 修改：增加更多週期的 ATR 計算，供進階特徵使用
         standard_indicators = ['SMA', 'EMA', 'RSI', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI', 'ATR']
-        for p in [5, 14, 20]: df_finta[f'ATR_{p}'] = TA.ATR(df_finta, period=p)
+        for p in [5, 14, 20]: 
+            df_finta[f'ATR_{p}'] = TA.ATR(df_finta, period=p)
         
-        # ... 其餘基礎指標計算無變動 ...
         df_finta = df_finta.join(TA.DMI(df_finta))
         periods = [10, 20, 50]
         for indicator in ['SMA', 'EMA', 'RSI', 'WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI']:
             method = getattr(TA, indicator)
-            if indicator in ['RSI']: df_finta[f'{indicator}_14'] = method(df_finta, period=14)
-            elif indicator in ['WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI']: df_finta[indicator] = method(df_finta)
+            if indicator in ['RSI']: 
+                df_finta[f'{indicator}_14'] = method(df_finta, period=14)
+            elif indicator in ['WILLIAMS', 'CCI', 'SAR', 'OBV', 'MFI']: 
+                df_finta[indicator] = method(df_finta)
             else:
-                for p in periods: df_finta[f'{indicator}_{p}'] = method(df_finta, period=p)
-        df_finta = df_finta.join(TA.STOCH(df_finta)); df_finta = df_finta.join(TA.MACD(df_finta)); df_finta = df_finta.join(TA.BBANDS(df_finta))
+                for p in periods: 
+                    df_finta[f'{indicator}_{p}'] = method(df_finta, period=p)
+        
+        df_finta = df_finta.join(TA.STOCH(df_finta))
+        df_finta = df_finta.join(TA.MACD(df_finta))
+        df_finta = df_finta.join(TA.BBANDS(df_finta))
         
         df_finta['body_size'] = abs(df_finta['close'] - df_finta['open'])
         df_finta['upper_wick'] = df_finta['high'] - df_finta[['open', 'close']].max(axis=1)
         df_finta['lower_wick'] = df_finta[['open', 'close']].min(axis=1) - df_finta['low']
         df_finta['body_vs_wick'] = df_finta['body_size'] / (df_finta['high'] - df_finta['low'] + 1e-9)
-        if 'DI+' in df_finta.columns and 'DI-' in df_finta.columns: df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
+        
+        if 'DI+' in df_finta.columns and 'DI-' in df_finta.columns: 
+            df_finta['DMI_DIFF'] = abs(df_finta['DI+'] - df_finta['DI-'])
 
         if 'ATR_14' in df_finta.columns:
             atr_series = df_finta['ATR_14'] + 1e-9
             df_finta['body_size_norm'] = df_finta['body_size'] / atr_series
-            if 'DMI_DIFF' in df_finta.columns: df_finta['DMI_DIFF_norm'] = df_finta['DMI_DIFF'] / atr_series
+            if 'DMI_DIFF' in df_finta.columns: 
+                df_finta['DMI_DIFF_norm'] = df_finta['DMI_DIFF'] / atr_series
         
         df_finta.rename(columns={'volume': 'tick_volume'}, inplace=True)
         return df_finta
 
-    # ★★★ 新增：進階時間特徵 ★★★
+    # ★★★ 新增：市場微結構特徵 ★★★
+    def _add_market_microstructure_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """新增市場微結構特徵,以捕捉K棒內的買賣力道"""
+        self.logger.info("Adding market microstructure features...")
+        df_out = df.copy()
+        
+        # 1. 買賣壓力指標 (Buying Pressure) [cite: 29, 310]
+        df_out['buying_pressure'] = (df_out['close'] - df_out['low']) / (df_out['high'] - df_out['low'] + 1e-9)
+        
+        # 2. 價格效率比率 (Efficiency Ratio) [cite: 34, 311]
+        net_change = abs(df_out['close'].diff(20))
+        total_movement = df_out['close'].diff().abs().rolling(20).sum()
+        df_out['efficiency_ratio'] = net_change / (total_movement + 1e-9)
+        
+        # 3. 訂單流不平衡代理 (Order Flow Imbalance Proxy) [cite: 38]
+        ofi_proxy = (df_out['tick_volume'] * np.sign(df_out['close'].diff())).fillna(0)
+        df_out['ofi_cumsum_20'] = ofi_proxy.rolling(20).sum()
+        
+        self.logger.debug("Added market microstructure features (buying_pressure, efficiency_ratio, ofi_cumsum_20).")
+        return df_out
+
+    # ★★★ 新增：市場狀態識別特徵 ★★★
+    def _add_regime_detection_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """新增市場狀態識別特徵,以判斷趨勢/盤整及波動狀態"""
+        self.logger.info("Adding regime detection features...")
+        df_out = df.copy()
+        
+        # 1. 波動率狀態 (Volatility Regime) [cite: 45]
+        returns = df_out['close'].pct_change()
+        df_out['volatility_20p'] = returns.rolling(20).std()
+        
+        # 使用Z-score使其標準化,更易於比較 [cite: 48]
+        vol_mean_60 = df_out['volatility_20p'].rolling(60).mean()
+        vol_std_60 = df_out['volatility_20p'].rolling(60).std()
+        df_out['vol_regime_zscore'] = (df_out['volatility_20p'] - vol_mean_60) / (vol_std_60 + 1e-9)
+        
+        # 2. 趨勢強度 (Trend Strength) - 使用 ADX [cite: 49]
+        try:
+            # 注意: finta 的 TA.ADX 返回一個 DataFrame,我們需要選擇 ADX 列
+            adx_df = TA.ADX(df_out, period=14)
+            if isinstance(adx_df, pd.DataFrame) and 'ADX' in adx_df.columns:
+                df_out['adx_14'] = adx_df['ADX']
+            else:
+                df_out['adx_14'] = adx_df
+            
+            # 標準化到 0-1 [cite: 51]
+            df_out['trend_strength'] = (df_out['adx_14'] / 100).fillna(0)
+        except Exception as e:
+            self.logger.warning(f"ADX calculation failed: {e}. Using alternative trend strength calculation.")
+            # 替代方法：使用移動平均斜率
+            ma_20 = df_out['close'].rolling(20).mean()
+            trend_slope = ma_20.diff(10) / ma_20.shift(10)
+            df_out['trend_strength'] = abs(trend_slope).fillna(0)
+            df_out['adx_14'] = df_out['trend_strength'] * 100
+        
+        # 3. 市場狀態分類 (Market Regime Classification) [cite: 52]
+        conditions = [
+            (df_out['vol_regime_zscore'] > 1) & (df_out['trend_strength'] > 0.3),   # 高波動趨勢 [cite: 55]
+            (df_out['vol_regime_zscore'] > 1) & (df_out['trend_strength'] <= 0.3),  # 高波動盤整 [cite: 56]
+            (df_out['vol_regime_zscore'] <= 1) & (df_out['trend_strength'] > 0.3),  # 低波動趨勢 [cite: 57]
+            (df_out['vol_regime_zscore'] <= 1) & (df_out['trend_strength'] <= 0.3)   # 低波動盤整 [cite: 58]
+        ]
+        choices = [3, 2, 1, 0]  # 3:高波動趨勢, 2:高波動盤整, 1:低波動趨勢, 0:低波動盤整
+        df_out['market_regime'] = np.select(conditions, choices, default=0)
+        
+        self.logger.debug("Added regime detection features (vol_regime_zscore, trend_strength, market_regime).")
+        return df_out
+
     def _add_advanced_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df_out = df.copy()
         hour = df_out.index.hour
@@ -96,7 +171,6 @@ class FeatureEngineer:
         self.logger.debug("Added advanced time-based features.")
         return df_out
 
-    # ★★★ 新增：價格行為特徵 ★★★
     def _add_price_action_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df_out = df.copy()
         if 'SMA_50' in df_out.columns and 'ATR_14' in df_out.columns:
@@ -108,7 +182,6 @@ class FeatureEngineer:
         self.logger.debug("Added price action features.")
         return df_out
 
-    # ★★★ 新增：進階波動率特徵 ★★★
     def _add_advanced_volatility_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df_out = df.copy()
         if 'ATR_5' in df_out.columns and 'ATR_20' in df_out.columns:
@@ -118,7 +191,6 @@ class FeatureEngineer:
         self.logger.debug("Added advanced volatility features.")
         return df_out
 
-    # ★★★ 新增：跨市場關聯特徵 ★★★
     def _add_cross_market_features(self, df: pd.DataFrame, symbol: str, all_market_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         df_out = df.copy()
         # 範例：僅為 GBPUSD 添加與 EURUSD 的滾動相關性
@@ -135,7 +207,6 @@ class FeatureEngineer:
         return df_out
 
     def _add_multi_period_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # ... 此函數無變動 ...
         df_out = df.copy()
         for n in [5, 10, 20, 60]:
             df_out[f'returns_{n}p'] = df_out['close'].pct_change(periods=n)
@@ -143,7 +214,6 @@ class FeatureEngineer:
         return df_out
 
     def _add_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # ... 此函數無變動 ...
         df_out = df.copy()
         if 'RSI_14' in df_out.columns and 'volatility_20p' in df_out.columns:
             df_out['RSI_x_volatility'] = (df_out['RSI_14'] - 50) * df_out['volatility_20p']
@@ -152,16 +222,24 @@ class FeatureEngineer:
         return df_out
         
     def _add_event_features(self, df: pd.DataFrame, events_df: Optional[pd.DataFrame], symbol: str) -> pd.DataFrame:
-        # ... 此函數無變動 ...
         df_out = df.copy()
         if events_df is None or events_df.empty:
-            df_out['time_to_next_event'] = 999; df_out['next_event_importance'] = 0; return df_out
-        currency1 = symbol[:3].upper(); currency2 = symbol[3:6].upper()
+            df_out['time_to_next_event'] = 999
+            df_out['next_event_importance'] = 0
+            return df_out
+        
+        currency1 = symbol[:3].upper()
+        currency2 = symbol[3:6].upper()
         relevant_events = events_df[events_df['currency'].isin([currency1, currency2])].copy()
+        
         if relevant_events.empty:
-            df_out['time_to_next_event'] = 999; df_out['next_event_importance'] = 0; return df_out
+            df_out['time_to_next_event'] = 999
+            df_out['next_event_importance'] = 0
+            return df_out
+            
         relevant_events.reset_index(inplace=True)
-        df_merged = pd.merge_asof(left=df_out.sort_index(), right=relevant_events.sort_values('timestamp_utc'), left_index=True, right_on='timestamp_utc', direction='forward')
+        df_merged = pd.merge_asof(left=df_out.sort_index(), right=relevant_events.sort_values('timestamp_utc'), 
+                                left_index=True, right_on='timestamp_utc', direction='forward')
         df_merged.index = df_out.index
         time_diff = df_merged['timestamp_utc'] - df_out.index
         df_out['time_to_next_event'] = time_diff.dt.total_seconds() / 3600
@@ -169,8 +247,8 @@ class FeatureEngineer:
         df_out.fillna({'time_to_next_event': 999, 'next_event_importance': 0}, inplace=True)
         return df_out
 
-    # ★★★ 修改：調整函數簽名與特徵計算順序 ★★★
-    def process_symbol_group(self, symbol: str, paths: Dict[str, Path], events_df: Optional[pd.DataFrame], factors_df: Optional[pd.DataFrame], all_market_data: Dict[str, pd.DataFrame]):
+    def process_symbol_group(self, symbol: str, paths: Dict[str, Path], events_df: Optional[pd.DataFrame], 
+                           factors_df: Optional[pd.DataFrame], all_market_data: Dict[str, pd.DataFrame]):
         self.logger.info(f"--- 開始處理商品組: {symbol} ---")
         
         dataframes = {}
@@ -179,11 +257,16 @@ class FeatureEngineer:
                 self.logger.info(f"[{symbol}] 正在處理 {tf} 數據...")
                 df = pd.read_parquet(paths[tf])
                 
-                # ★★★ 新的特徵計算流程 ★★★
+                # ★★★ 更新的特徵計算流程，加入新的市場微結構與狀態識別特徵 ★★★
                 df = self._add_advanced_time_features(df)
                 df = self._add_global_factor_features(df, factors_df)
                 df = self._add_event_features(df, events_df, symbol)
                 df = self._add_base_features(df)
+                
+                # [建議] 在基礎特徵之後,添加新特徵
+                df = self._add_market_microstructure_features(df)
+                df = self._add_regime_detection_features(df)
+                
                 df = self._add_advanced_volatility_features(df)
                 df = self._add_price_action_features(df)
                 df = self._add_multi_period_features(df)
@@ -197,58 +280,75 @@ class FeatureEngineer:
                     self.logger.info(f"[{symbol}/{tf}] 已新增 'is_uptrend' 趨勢過濾特徵。")
                 dataframes[tf] = df
 
-        # ... 後續融合邏輯無變動 ...
+        # 後續融合邏輯
         final_dataframes = {}
         cols_to_drop_before_merge = ['open', 'high', 'low', 'close', 'tick_volume', 'real_volume', 'spread']
-        if 'D1' in dataframes: final_dataframes['D1'] = dataframes['D1']
+        
+        if 'D1' in dataframes: 
+            final_dataframes['D1'] = dataframes['D1']
+            
         if 'H4' in dataframes and 'D1' in dataframes:
             self.logger.info(f"[{symbol}] 正在為 H4 數據融合 D1 特徵...")
             df_d1_renamed = dataframes['D1'].rename(columns=lambda c: f"D1_{c}" if c not in cols_to_drop_before_merge else c)
             df_d1_features_only = df_d1_renamed.drop(columns=cols_to_drop_before_merge, errors='ignore')
-            final_dataframes['H4'] = pd.merge_asof(dataframes['H4'].sort_index(), df_d1_features_only, left_index=True, right_index=True, direction='backward')
-        elif 'H4' in dataframes: final_dataframes['H4'] = dataframes['H4']
+            final_dataframes['H4'] = pd.merge_asof(dataframes['H4'].sort_index(), df_d1_features_only, 
+                                                 left_index=True, right_index=True, direction='backward')
+        elif 'H4' in dataframes: 
+            final_dataframes['H4'] = dataframes['H4']
+            
         if 'H1' in dataframes and 'H4' in final_dataframes:
-            self.logger.info(f"[{symbol}] 正在為 H1 數據融合 H1 特徵...")
+            self.logger.info(f"[{symbol}] 正在為 H1 數據融合 H4 特徵...")
             df_h4_renamed = final_dataframes['H4'].rename(columns=lambda c: f"H4_{c}" if c not in cols_to_drop_before_merge else c)
             df_h4_features_only = df_h4_renamed.drop(columns=cols_to_drop_before_merge, errors='ignore')
-            final_dataframes['H1'] = pd.merge_asof(dataframes['H1'].sort_index(), df_h4_features_only, left_index=True, right_index=True, direction='backward')
-        elif 'H1' in dataframes: final_dataframes['H1'] = dataframes['H1']
+            final_dataframes['H1'] = pd.merge_asof(dataframes['H1'].sort_index(), df_h4_features_only, 
+                                                 left_index=True, right_index=True, direction='backward')
+        elif 'H1' in dataframes: 
+            final_dataframes['H1'] = dataframes['H1']
+            
+        # 清理和保存數據
         for tf, df_final in final_dataframes.items():
             df_final.replace([np.inf, -np.inf], np.nan, inplace=True)
             rows_before = len(df_final)
             df_final.dropna(inplace=True)
             rows_after = len(df_final)
-            if rows_before > rows_after: self.logger.info(f"[{symbol}/{tf}] 移除了 {rows_before - rows_after} 行包含 NaN 的數據。剩餘 {rows_after} 筆。")
+            
+            if rows_before > rows_after: 
+                self.logger.info(f"[{symbol}/{tf}] 移除了 {rows_before - rows_after} 行包含 NaN 的數據。剩餘 {rows_after} 筆。")
+                
             relative_path = paths[tf].relative_to(self.config.INPUT_BASE_DIR)
             output_path = self.config.OUTPUT_BASE_DIR / relative_path
             output_path.parent.mkdir(parents=True, exist_ok=True)
             df_final.to_parquet(output_path)
             self.logger.info(f"[{symbol}/{tf}] 已儲存綜合特徵檔案到: {output_path}")
 
-    # ★★★ 修改：主流程增加數據預加載步驟 ★★★
     def run(self):
-        self.logger.info(f"========= 綜合特徵工程流程開始 (v5.9) =========")
+        self.logger.info(f"========= 綜合特徵工程流程開始 (v6.0) =========")
         events_df, factors_df = None, None
+        
         try:
             events_df = pd.read_csv(self.config.EVENTS_FILE_PATH, index_col='timestamp_utc', parse_dates=True)
             events_df.index = pd.to_datetime(events_df.index, utc=True)
             self.logger.info(f"成功從 {self.config.EVENTS_FILE_PATH} 讀取事件數據。")
-        except FileNotFoundError: self.logger.warning(f"警告：找不到事件檔案 {self.config.EVENTS_FILE_PATH}！")
+        except FileNotFoundError: 
+            self.logger.warning(f"警告：找不到事件檔案 {self.config.EVENTS_FILE_PATH}！")
+            
         try:
             factors_df = pd.read_parquet(self.config.GLOBAL_FACTORS_FILE_PATH)
             factors_df.index = pd.to_datetime(factors_df.index, utc=True)
             self.logger.info(f"成功從 {self.config.GLOBAL_FACTORS_FILE_PATH} 讀取全局因子數據。")
-        except FileNotFoundError: self.logger.warning(f"警告：找不到全局因子檔案 {self.config.GLOBAL_FACTORS_FILE_PATH}！")
+        except FileNotFoundError: 
+            self.logger.warning(f"警告：找不到全局因子檔案 {self.config.GLOBAL_FACTORS_FILE_PATH}！")
         
         input_files = list(self.config.INPUT_BASE_DIR.rglob("*.parquet"))
         if not input_files:
-            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。"); return
+            self.logger.warning("在輸入目錄中沒有找到任何 Parquet 檔案，流程結束。")
+            return
 
-        # ★★★ 新增：預加載所有市場數據以供跨市場分析 ★★★
+        # 預加載所有市場數據以供跨市場分析
         all_market_data = {}
         self.logger.info("正在預加載所有市場數據以進行跨市場分析...")
         for file_path in input_files:
-             if "_H4.parquet" in file_path.name: # 暫時只加載 H4 數據
+             if "_H4.parquet" in file_path.name:  # 暫時只加載 H4 數據
                 try:
                     all_market_data[file_path.stem] = pd.read_parquet(file_path)
                 except Exception as e:
@@ -258,9 +358,13 @@ class FeatureEngineer:
         symbol_groups = defaultdict(dict)
         for file_path in input_files:
             try:
-                parts = file_path.stem.split('_'); symbol = '_'.join(parts[:-1]); timeframe = parts[-1]
-                if timeframe in self.config.TIMEFRAME_ORDER: symbol_groups[symbol][timeframe] = file_path
-            except IndexError: self.logger.warning(f"無法解析檔名: {file_path.name}，已跳過。")
+                parts = file_path.stem.split('_')
+                symbol = '_'.join(parts[:-1])
+                timeframe = parts[-1]
+                if timeframe in self.config.TIMEFRAME_ORDER: 
+                    symbol_groups[symbol][timeframe] = file_path
+            except IndexError: 
+                self.logger.warning(f"無法解析檔名: {file_path.name}，已跳過。")
         
         self.logger.info(f"共找到 {len(symbol_groups)} 個商品組需要處理。")
         for symbol, paths in symbol_groups.items():
