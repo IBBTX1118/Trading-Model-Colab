@@ -742,62 +742,32 @@ class MLOptimizerAndBacktester:
             return self._get_empty_result()
 
     def _parse_backtest_results(self, strategy_result, cerebro) -> Dict:
-        """安全解析回測結果"""
+        """安全解析回測結果 (V2 - 遍歷交易記錄版)"""
         try:
-            # 基本盈虧計算
             final_value = cerebro.broker.getvalue()
             initial_value = self.wfo_config['initial_cash']
             total_pnl = final_value - initial_value
             
-            # 交易分析
-            trade_analyzer = strategy_result.analyzers.trades
-            trade_analysis = trade_analyzer.get_analysis()
+            trade_analyzer = strategy_result.analyzers.trades.get_analysis()
             
-            # 安全提取交易統計
-            total_trades = 0
-            won_trades = 0
-            lost_trades = 0
-            total_won_pnl = 0.0
-            total_lost_pnl = 0.0
+            total_trades = trade_analyzer.total.total if 'total' in trade_analyzer and 'total' in trade_analyzer.total else 0
+            if total_trades == 0:
+                return self._get_empty_result()
             
-            if trade_analysis and 'total' in trade_analysis:
-                total_info = trade_analysis['total']
-                if isinstance(total_info, dict) and 'total' in total_info:
-                    total_trades = total_info['total']
-                    
-                    if total_trades > 0:
-                        # 獲利交易
-                        won_info = trade_analysis.get('won', {})
-                        if isinstance(won_info, dict):
-                            won_trades = won_info.get('total', 0)
-                            if 'pnl' in won_info and isinstance(won_info['pnl'], dict):
-                                total_won_pnl = won_info['pnl'].get('total', 0.0)
-                        
-                        # 虧損交易
-                        lost_info = trade_analysis.get('lost', {})
-                        if isinstance(lost_info, dict):
-                            lost_trades = lost_info.get('total', 0)
-                            if 'pnl' in lost_info and isinstance(lost_info['pnl'], dict):
-                                total_lost_pnl = lost_info['pnl'].get('total', 0.0)
+            won_trades = trade_analyzer.won.total if 'won' in trade_analyzer and 'total' in trade_analyzer.won else 0
+            lost_trades = trade_analyzer.lost.total if 'lost' in trade_analyzer and 'total' in trade_analyzer.lost else 0
             
-            # 回撤分析
-            drawdown_analyzer = strategy_result.analyzers.drawdown
-            drawdown_analysis = drawdown_analyzer.get_analysis()
-            max_drawdown = 0.0
-            if drawdown_analysis and 'max' in drawdown_analysis:
-                max_info = drawdown_analysis['max']
-                if isinstance(max_info, dict):
-                    max_drawdown = max_info.get('drawdown', 0.0)
+            total_won_pnl = trade_analyzer.won.pnl.total if 'won' in trade_analyzer and 'pnl' in trade_analyzer.won and 'total' in trade_analyzer.won.pnl else 0.0
+            total_lost_pnl = trade_analyzer.lost.pnl.total if 'lost' in trade_analyzer and 'pnl' in trade_analyzer.lost and 'total' in trade_analyzer.lost.pnl else 0.0
             
-            # 夏普比率
-            sharpe_analyzer = strategy_result.analyzers.sharpe
-            sharpe_analysis = sharpe_analyzer.get_analysis()
-            sharpe_ratio = 0.0
-            if sharpe_analysis and 'sharperatio' in sharpe_analysis:
-                sharpe_ratio = sharpe_analysis['sharperatio']
-                if sharpe_ratio is None or np.isnan(sharpe_ratio) or np.isinf(sharpe_ratio):
-                    sharpe_ratio = 0.0
+            drawdown_analyzer = strategy_result.analyzers.drawdown.get_analysis()
+            max_drawdown = drawdown_analyzer.max.drawdown if 'max' in drawdown_analyzer and 'drawdown' in drawdown_analyzer.max else 0.0
             
+            sharpe_analyzer = strategy_result.analyzers.sharpe.get_analysis()
+            sharpe_ratio = sharpe_analyzer.get('sharperatio', 0.0)
+            if sharpe_ratio is None or np.isnan(sharpe_ratio) or np.isinf(sharpe_ratio):
+                sharpe_ratio = 0.0
+                
             return {
                 'pnl': total_pnl,
                 'total_trades': total_trades,
@@ -809,7 +779,6 @@ class MLOptimizerAndBacktester:
                 'sharpe_ratio': sharpe_ratio,
                 'sqn': 0.0,
             }
-            
         except Exception as e:
             print(f"結果解析錯誤: {e}")
             return self._get_empty_result()
