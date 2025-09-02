@@ -1,4 +1,4 @@
-# 檔名: 01.6_global_factors_acquisition.py
+# 檔名: 1.2_global_factors_acquisition.py
 # 描述: 從 Yahoo Finance 獲取美元指數(DXY)和VIX指數的歷史數據。
 # 版本: 2.0 (改用 yfinance 提高穩定性)
 
