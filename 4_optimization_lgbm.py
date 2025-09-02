@@ -1,4 +1,4 @@
-# 檔名: 04_optimization_lgbm.py
+# 檔名: 4_optimization_lgbm.py
 # 描述: 【二分類重構版】 - 使用 LightGBM 模型進行參數優化與回測，擴大搜索範圍
 # 版本: 15.1 (Binary Classification Refactor - Enhanced Search Range)
 
