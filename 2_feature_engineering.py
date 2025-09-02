@@ -1,4 +1,4 @@
-# 檔名: 02_feature_engineering.py
+# 檔名: 2_feature_engineering.py
 # 版本: 7.1 (穩健版 - 改進數據清理邏輯)
 # 描述: 整合多維度高級特徵，新增價格通道、波動率不對稱性及互動特徵，並使用更穩健的數據清理方法。
 
@@ -465,3 +465,4 @@ if __name__ == "__main__":
     except Exception as e:
         logging.critical(f"特徵工程腳本執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
         sys.exit(1)
+
