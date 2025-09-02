@@ -1,4 +1,4 @@
-# 檔名: 00_quick_diagnostics.py
+# 檔名: 0_quick_diagnostics.py
 # 描述: 快速診斷模型問題的腳本
 # 版本: 1.0
 
