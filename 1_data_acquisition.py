@@ -1,4 +1,4 @@
-# 檔名: 01_data_acquisition.py
+# 檔名: 1_data_acquisition.py
 # 描述: 從 MetaTrader 5 獲取、處理、驗證並儲存市場數據。
 # 版本: 2.2 (實現結束日期自動化)
 
@@ -208,3 +208,4 @@ if __name__ == "__main__":
         pipeline_config = PipelineConfig(**config_dict); data_pipeline = MT5DataPipeline(config=pipeline_config); data_pipeline.run_pipeline()
     except ValidationError as e: print(f"配置錯誤: \n{e}"); sys.exit(1)
     except Exception as e: logging.critical(f"執行數據管道時發生未預期的嚴重錯誤: {e}", exc_info=True); sys.exit(1)
+
