@@ -1,4 +1,4 @@
-# 檔名: 02.5_feature_debugger.py
+# 檔名: 2.1_feature_debugger.py
 # 描述: 專用於偵錯 02_feature_engineering.py，檢查每一步的 NaN 產生情況
 # 版本: 1.1 (修復版 - 移除魔法命令並增強診斷功能)
 
