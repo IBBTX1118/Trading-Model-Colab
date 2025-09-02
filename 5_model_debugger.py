@@ -1,4 +1,4 @@
-# 檔名: 05_model_debugger.py (v2.1 - Colab 修復版)
+# 檔名: 5_model_debugger.py (v2.1 - Colab 修復版)
 # 描述: 修復在Google Colab中運行的語法錯誤和兼容性問題
 
 import pandas as pd
