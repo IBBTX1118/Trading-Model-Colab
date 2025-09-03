@@ -6,6 +6,7 @@ pyarrow
 finta
 setuptools
 pydantic
+seaborn
 
 # 機器學習與特徵篩選
 scikit-learn
