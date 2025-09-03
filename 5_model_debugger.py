@@ -23,7 +23,7 @@ print("🚀 模型調試工具 - Colab修復版 (v2.1)")
 print("="*60)
 
 # --- 設定區塊 ---
-MARKET_NAME = "EURUSD_sml_H4"  # 選擇一個市場來進行偵錯
+MARKET_NAME = "USDJPY_sml_H1"  # 選擇一個市場來進行偵錯
 FEATURE_DATA_PATH = Path("Output_Feature_Engineering/MarketData_with_Combined_Features_v3")
 ML_OUTPUT_PATH = Path("Output_ML_Pipeline")
 CONFIG_PATH = Path("config.yaml")
