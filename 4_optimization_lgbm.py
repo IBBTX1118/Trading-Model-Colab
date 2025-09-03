@@ -255,6 +255,11 @@ class MLOptimizerAndBacktester:
                 'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05)}
             if strategy_updates['tp_atr_multiplier'] <= strategy_updates['sl_atr_multiplier']: return -999.0
             model = lgb.LGBMClassifier(**model_params).fit(X_train, y_train)
+            
+            # 檢查模型預測分佈
+            train_preds = model.predict_proba(X_train)[:, 1]
+            self.logger.debug(f"訓練集預測分佈: 均值={train_preds.mean():.3f}, 標準差={train_preds.std():.3f}")
+            
             df_val_trades_only = df_val[df_val['label'] != 0].copy()
             if df_val_trades_only.empty: return -999.0
             result = self.run_backtest_on_fold(df_val_trades_only, model, available_features, {**self.strategy_params, **strategy_updates})
