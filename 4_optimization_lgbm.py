@@ -1,6 +1,6 @@
 # 檔名: 4_optimization_lgbm.py
 # 描述: 【二分類重構版】 - 使用 LightGBM 模型進行參數優化與回測
-# 版本: 15.4 (最終穩健版 - Robust Strategy Initialization & Sizing)
+# 版本: 15.5 (修正時間窗口計算錯誤)
 
 import sys
 import yaml
@@ -39,7 +39,6 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     sl_multiplier = settings['sl_atr_multiplier']
     max_hold = settings['max_hold_periods']
 
-    # 動態找到ATR欄位 (優先使用D1的ATR，若無則用當前的)
     atr_col_name = next((col for col in df_out.columns if 'D1_ATR_14' in col), None)
     if atr_col_name is None:
         atr_col_name = next((col for col in df_out.columns if 'ATR_14' in col), None)
@@ -79,60 +78,29 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     return df_out.join(outcomes.to_frame())
 
 # ==============================================================================
-#                      交易策略 (整合所有修正)
+#                      交易策略
 # ==============================================================================
 class BinaryMLStrategy(bt.Strategy):
     """機器學習交易策略 (二分類版)"""
-
-    params = (
-        ('model', None),
-        ('features', None),
-        ('entry_threshold', 0.55),
-        ('tp_atr_multiplier', 1.8),
-        ('sl_atr_multiplier', 2.0),
-        ('risk_per_trade', 0.015),
-    )
+    params = (('model', None), ('features', None), ('entry_threshold', 0.55),
+              ('tp_atr_multiplier', 1.8), ('sl_atr_multiplier', 2.0), ('risk_per_trade', 0.015))
 
     def __init__(self):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
 
-        # ★★★ 核心修正 v15.4：使用更穩健、具備優先級的方式尋找指標 ★★★
-        self.trend_indicator = None
-        # 依序尋找最可能出現的趨勢指標名稱 (從最 specific 到最 general)
-        trend_indicator_names = ['H4_D1_is_uptrend', 'D1_is_uptrend', 'is_uptrend']
-        for name in trend_indicator_names:
-            if hasattr(self.data.lines, name):
-                self.trend_indicator = getattr(self.data.lines, name)
-                print(f"✅ 成功找到並使用趨勢指標: {name}")
-                break
-
-        self.atr_indicator = None
-        # 依序尋找最可能出現的ATR指標名稱 (優先使用當前週期的ATR)
-        atr_indicator_names = ['ATR_14', 'H4_D1_ATR_14', 'D1_ATR_14']
-        for name in atr_indicator_names:
-            if hasattr(self.data.lines, name):
-                self.atr_indicator = getattr(self.data.lines, name)
-                print(f"✅ 成功找到並使用ATR指標: {name}")
-                break
+        self.trend_indicator = next((getattr(self.data.lines, n) for n in ['H4_D1_is_uptrend', 'D1_is_uptrend', 'is_uptrend'] if hasattr(self.data.lines, n)), None)
+        self.atr_indicator = next((getattr(self.data.lines, n) for n in ['ATR_14', 'H4_D1_ATR_14', 'D1_ATR_14'] if hasattr(self.data.lines, n)), None)
         
-        # 確保關鍵指標存在
-        if self.atr_indicator is None:
-            raise ValueError("❌ 找不到任何可用的ATR指標，策略無法運行")
-        if self.trend_indicator is None:
-            print("⚠️ 警告: 找不到趨勢指標，策略將使用默認上漲趨勢 (is_uptrend = True)。")
+        if self.atr_indicator is None: raise ValueError("❌ 找不到任何可用的ATR指標，策略無法運行")
+        if self.trend_indicator is None: print("⚠️ 警告: 找不到趨勢指標，策略將使用默認上漲趨勢 (is_uptrend = True)。")
 
         self.current_order = None
 
-    def log(self, txt, dt=None):
-        # 為了保持日誌乾淨，優化過程中可以暫時關閉打印
-        pass
-
+    def log(self, txt, dt=None): pass
     def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-        if order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log(f'訂單失敗: {order.getstatusname()}')
+        if order.status in [order.Submitted, order.Accepted]: return
+        if order.status in [order.Canceled, order.Margin, order.Rejected]: self.log(f'訂單失敗: {order.getstatusname()}')
         self.current_order = None
 
     def get_feature_values(self) -> Dict:
@@ -141,89 +109,60 @@ class BinaryMLStrategy(bt.Strategy):
             for value in feature_values.values():
                 if pd.isna(value) or np.isinf(value): return None
             return feature_values
-        except Exception:
-            return None
+        except Exception: return None
 
     def make_prediction(self, feature_values: Dict) -> float:
-        try:
-            return self.p.model.predict_proba(pd.DataFrame([feature_values]))[0][1]
-        except Exception:
-            return 0.0
+        try: return self.p.model.predict_proba(pd.DataFrame([feature_values]))[0][1]
+        except Exception: return 0.0
 
     def calculate_position_size(self, atr_value: float) -> float:
-        """計算持倉大小 (v15.3 - 穩健版)"""
         try:
             portfolio_value = self.broker.getvalue()
             sl_distance = atr_value * self.p.sl_atr_multiplier
-            
             min_sl_distance = self.data.close[0] * 0.0005
-            if sl_distance < min_sl_distance:
-                return 0.0
-
+            if sl_distance < min_sl_distance: return 0.0
             risk_amount = portfolio_value * self.p.risk_per_trade
             position_size = risk_amount / sl_distance
-            
             max_position_value = portfolio_value * 10
             if (position_size * self.data.close[0]) > max_position_value:
                 position_size = max_position_value / self.data.close[0]
-
             return max(position_size, 0.001)
-        except Exception:
-            return 0.0
+        except Exception: return 0.0
 
     def next(self):
         if self.current_order or self.position: return
-
         feature_values = self.get_feature_values()
         if feature_values is None: return
-
         win_prob = self.make_prediction(feature_values)
         current_price = self.data.close[0]
         atr_value = self.atr_indicator[0]
         if atr_value <= 0 or pd.isna(atr_value): return
-
-        is_uptrend = True
-        if self.trend_indicator is not None:
-            try: is_uptrend = self.trend_indicator[0] > 0.5
-            except IndexError: return
-
+        is_uptrend = self.trend_indicator[0] > 0.5 if self.trend_indicator is not None else True
         position_size = self.calculate_position_size(atr_value)
         if position_size <= 0: return
-
         try:
             if is_uptrend and win_prob > self.p.entry_threshold:
-                sl_price = current_price - (atr_value * self.p.sl_atr_multiplier)
-                tp_price = current_price + (atr_value * self.p.tp_atr_multiplier)
-                main_order = self.buy(size=position_size)
-                if main_order:
-                    self.sell(size=position_size, exectype=bt.Order.Stop, price=sl_price, parent=main_order)
-                    self.sell(size=position_size, exectype=bt.Order.Limit, price=tp_price, parent=main_order)
-                    self.current_order = main_order
+                sl = current_price - (atr_value * self.p.sl_atr_multiplier)
+                tp = current_price + (atr_value * self.p.tp_atr_multiplier)
+                order = self.buy(size=position_size)
+                if order: self.sell(size=position_size, exectype=bt.Order.Stop, price=sl, parent=order); self.sell(size=position_size, exectype=bt.Order.Limit, price=tp, parent=order); self.current_order = order
             elif not is_uptrend and win_prob > self.p.entry_threshold:
-                sl_price = current_price + (atr_value * self.p.sl_atr_multiplier)
-                tp_price = current_price - (atr_value * self.p.tp_atr_multiplier)
-                main_order = self.sell(size=position_size)
-                if main_order:
-                    self.buy(size=position_size, exectype=bt.Order.Stop, price=sl_price, parent=main_order)
-                    self.buy(size=position_size, exectype=bt.Order.Limit, price=tp_price, parent=main_order)
-                    self.current_order = main_order
-        except Exception:
-            pass
+                sl = current_price + (atr_value * self.p.sl_atr_multiplier)
+                tp = current_price - (atr_value * self.p.tp_atr_multiplier)
+                order = self.sell(size=position_size)
+                if order: self.buy(size=position_size, exectype=bt.Order.Stop, price=sl, parent=order); self.buy(size=position_size, exectype=bt.Order.Limit, price=tp, parent=order); self.current_order = order
+        except Exception: pass
 
 # ==============================================================================
-#                      優化器與回測器 (無需修改)
+#                      優化器與回測器
 # ==============================================================================
 class MLOptimizerAndBacktester:
-    """機器學習優化器與回測器 - 二分類版"""
-    
     def __init__(self, config: Dict):
         self.config = config; self.paths = config['paths']; self.wfo_config = config['walk_forward_optimization']
         self.strategy_params = config.get('strategy_params', {}); self.tb_settings = config['triple_barrier_settings']
-        self.strategy_params.update({
-            'tp_atr_multiplier': self.tb_settings.get('tp_atr_multiplier', 2.5),
-            'sl_atr_multiplier': self.tb_settings.get('sl_atr_multiplier', 1.5),
-            'risk_per_trade': self.strategy_params.get('risk_per_trade', 0.02)
-        })
+        self.strategy_params.update({'tp_atr_multiplier': self.tb_settings.get('tp_atr_multiplier', 2.5),
+                                     'sl_atr_multiplier': self.tb_settings.get('sl_atr_multiplier', 1.5),
+                                     'risk_per_trade': self.strategy_params.get('risk_per_trade', 0.02)})
         self.logger = self._setup_logger(); self.output_base_dir = Path(self.paths['ml_pipeline_output'])
         self.output_base_dir.mkdir(parents=True, exist_ok=True); self.all_market_results = {}
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -254,31 +193,30 @@ class MLOptimizerAndBacktester:
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2), 'n_estimators': trial.suggest_int('n_estimators', 100, 500),
                 'num_leaves': trial.suggest_int('num_leaves', 20, 100), 'max_depth': trial.suggest_int('max_depth', 3, 10),
                 'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 1.0, log=True), 'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 1.0, log=True)}
-            neg_count, pos_count = (y_train == 0).sum(), (y_train == 1).sum()
-            if pos_count > 0 and neg_count > 0: model_params['scale_pos_weight'] = neg_count / pos_count
+            neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
+            if pos > 0 and neg > 0: model_params['scale_pos_weight'] = neg / pos
             strategy_updates = {'entry_threshold': trial.suggest_float('entry_threshold', 0.55, 0.85),
-                'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.2, 3.0),
-                'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.5, 3.5),
-                'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05)}
+                                'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.2, 3.0),
+                                'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.5, 3.5),
+                                'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05)}
             if strategy_updates['tp_atr_multiplier'] <= strategy_updates['sl_atr_multiplier']: return -999.0
             model = lgb.LGBMClassifier(**model_params).fit(X_train, y_train)
-            df_val_trades_only = df_val[df_val['label'] != 0].copy()
-            if df_val_trades_only.empty: return -999.0
-            result = self.run_backtest_on_fold(df_val_trades_only, model, available_features, {**self.strategy_params, **strategy_updates})
+            df_val_trades = df_val[df_val['label'] != 0].copy()
+            if df_val_trades.empty: return -999.0
+            result = self.run_backtest_on_fold(df_val_trades, model, available_features, {**self.strategy_params, **strategy_updates})
             if result.get('total_trades', 0) < 10: return -999.0
-            sharpe_ratio = result.get('sharpe_ratio', -999.0)
-            return sharpe_ratio if not np.isnan(sharpe_ratio) else -999.0
+            sharpe = result.get('sharpe_ratio', -999.0)
+            return sharpe if not np.isnan(sharpe) else -999.0
         except Exception: return -999.0
 
-    def run_backtest_on_fold(self, df_fold: pd.DataFrame, model, available_features: List[str], strategy_params_override: Dict = None) -> Dict:
+    def run_backtest_on_fold(self, df_fold: pd.DataFrame, model, features: List[str], params: Dict = None) -> Dict:
         if df_fold.empty: return self._get_empty_result()
         try:
             class PandasDataWithFeatures(bt.feeds.PandasData):
                 lines = tuple(df_fold.columns); params = (('volume', 'tick_volume'),) + tuple([(c, -1) for c in df_fold.columns])
             cerebro = bt.Cerebro(stdstats=False)
             cerebro.adddata(PandasDataWithFeatures(dataname=df_fold))
-            final_strategy_params = strategy_params_override or self.strategy_params
-            cerebro.addstrategy(BinaryMLStrategy, model=model, features=available_features, **final_strategy_params)
+            cerebro.addstrategy(BinaryMLStrategy, model=model, features=features, **(params or self.strategy_params))
             cerebro.broker.setcash(self.wfo_config['initial_cash'])
             cerebro.broker.setcommission(commission=self.wfo_config['commission'])
             for name, analyzer in [('trades', bt.analyzers.TradeAnalyzer), ('drawdown', bt.analyzers.DrawDown), ('sharpe', bt.analyzers.SharpeRatio)]:
@@ -287,20 +225,19 @@ class MLOptimizerAndBacktester:
             return self._parse_backtest_results(results[0], cerebro) if results else self._get_empty_result()
         except Exception as e: self.logger.error(f"回測執行錯誤: {e}"); traceback.print_exc(); return self._get_empty_result()
 
-    def _parse_backtest_results(self, strategy_result, cerebro) -> Dict:
+    def _parse_backtest_results(self, res, cerebro) -> Dict:
         try:
-            analyzers = strategy_result.analyzers
-            final_value = cerebro.broker.getvalue()
-            trade_analysis = analyzers.trades.get_analysis()
-            total_trades = trade_analysis.total.total if hasattr(trade_analysis.total, 'total') else 0
-            if total_trades == 0: return self._get_empty_result(pnl=final_value - self.wfo_config['initial_cash'])
-            sharpe_ratio = analyzers.sharpe.get_analysis().get('sharperatio', 0.0) or 0.0
-            return {'pnl': final_value - self.wfo_config['initial_cash'], 'total_trades': total_trades,
-                    'won_trades': trade_analysis.won.total if hasattr(trade_analysis.won, 'total') else 0,
-                    'lost_trades': trade_analysis.lost.total if hasattr(trade_analysis.lost, 'total') else 0,
-                    'pnl_won_total': trade_analysis.won.pnl.total if hasattr(trade_analysis.won.pnl, 'total') else 0.0,
-                    'pnl_lost_total': trade_analysis.lost.pnl.total if hasattr(trade_analysis.lost.pnl, 'total') else 0.0,
-                    'max_drawdown': analyzers.drawdown.get_analysis().max.drawdown, 'sharpe_ratio': sharpe_ratio}
+            val = cerebro.broker.getvalue()
+            trades = res.analyzers.trades.get_analysis()
+            total = trades.total.total if hasattr(trades.total, 'total') else 0
+            if total == 0: return self._get_empty_result(pnl=val - self.wfo_config['initial_cash'])
+            sharpe = res.analyzers.sharpe.get_analysis().get('sharperatio', 0.0) or 0.0
+            return {'pnl': val - self.wfo_config['initial_cash'], 'total_trades': total,
+                    'won_trades': trades.won.total if hasattr(trades.won, 'total') else 0,
+                    'lost_trades': trades.lost.total if hasattr(trades.lost, 'total') else 0,
+                    'pnl_won_total': trades.won.pnl.total if hasattr(trades.won.pnl, 'total') else 0.0,
+                    'pnl_lost_total': trades.lost.pnl.total if hasattr(trades.lost.pnl, 'total') else 0.0,
+                    'max_drawdown': res.analyzers.drawdown.get_analysis().max.drawdown, 'sharpe_ratio': sharpe}
         except Exception as e: self.logger.error(f"結果解析錯誤: {e}"); return self._get_empty_result()
 
     def _get_empty_result(self, pnl=0.0) -> Dict:
@@ -329,35 +266,49 @@ class MLOptimizerAndBacktester:
         start_date, end_date = df.index.min(), df.index.max()
         wfo_days = {k: timedelta(days=self.wfo_config[k]) for k in ['training_days', 'validation_days', 'testing_days', 'step_days']}
         current_date, fold_results, all_fold_best_params = start_date, [], []
+        
         for fold_number in range(1, 100):
-            train_start, val_start, test_start, test_end = current_date, current_date + wfo_days['training_days'], \
-                                                           val_start + wfo_days['validation_days'], test_start + wfo_days['testing_days']
+            # ★★★ 核心修正 v15.5：拆分時間窗口賦值，避免 UnboundLocalError ★★★
+            train_start = current_date
+            val_start = train_start + wfo_days['training_days']
+            test_start = val_start + wfo_days['validation_days']
+            test_end = test_start + wfo_days['testing_days']
+
             if test_end > end_date: break
+            
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}~{val_start.date()}] | Val[{val_start.date()}~{test_start.date()}] | Test[{test_start.date()}~{test_end.date()}] ---")
             try:
                 df_train, df_val, df_test = df.loc[train_start:val_start-timedelta(seconds=1)], df.loc[val_start:test_start-timedelta(seconds=1)], df.loc[test_start:test_end-timedelta(seconds=1)]
                 df_train_trades = df_train[df_train['label'] != 0].copy()
                 if len(df_train_trades) < 50: self.logger.warning(f"Fold {fold_number} 訓練信號不足 ({len(df_train_trades)}個)，跳過"); current_date += wfo_days['step_days']; continue
+                
                 df_train_trades['target_binary'] = (df_train_trades['label'] == 1).astype(int)
                 X_train, y_train = df_train_trades[available_features], df_train_trades['target_binary']
+                
                 study = optuna.create_study(direction='maximize')
                 study.optimize(lambda t: self.objective(t, X_train, y_train, df_val, available_features),
                                n_trials=self.wfo_config.get('n_trials', 30), show_progress_bar=True)
+                               
                 self.logger.info(f"優化完成！最佳夏普比率: {study.best_value:.4f}")
                 all_fold_best_params.append({'fold': fold_number, 'best_sharpe_in_val': study.best_value, **study.best_params})
+                
                 df_in_sample = pd.concat([df_train, df_val])[lambda x: x['label'] != 0].copy()
                 df_in_sample['target_binary'] = (df_in_sample['label'] == 1).astype(int)
                 X_in_sample, y_in_sample = df_in_sample[available_features], df_in_sample['target_binary']
+                
                 model_params = {k: v for k, v in study.best_params.items() if k not in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier', 'risk_per_trade']}
                 model_params.update({'objective': 'binary', 'metric': 'logloss', 'verbosity': -1, 'seed': 42})
                 neg, pos = (y_in_sample==0).sum(), (y_in_sample==1).sum()
                 if pos > 0 and neg > 0: model_params['scale_pos_weight'] = neg / pos
+                
                 final_model = lgb.LGBMClassifier(**model_params).fit(X_in_sample, y_in_sample)
+                
                 if not df_test[df_test['label'] != 0].empty:
                     final_params = {**self.strategy_params, **{k: study.best_params[k] for k in ['entry_threshold', 'tp_atr_multiplier', 'sl_atr_multiplier', 'risk_per_trade'] if k in study.best_params}}
                     result = self.run_backtest_on_fold(df_test, final_model, available_features, final_params)
                     if result and result['total_trades'] > 0:
-                        fold_results.append(result); win_rate = result['won_trades'] / result['total_trades'] * 100
+                        fold_results.append(result)
+                        win_rate = result['won_trades'] / result['total_trades'] * 100
                         print(f"Fold {fold_number} 結果: PnL={result.get('pnl', 0):.2f}, 交易={result['total_trades']}, 勝率={win_rate:.1f}%, 夏普={result.get('sharpe_ratio', 0):.3f}")
             except Exception as e: self.logger.error(f"Fold {fold_number} 處理失敗: {e}")
             current_date += wfo_days['step_days']
@@ -387,7 +338,7 @@ class MLOptimizerAndBacktester:
         except Exception as e: self.logger.error(f"保存結果時發生錯誤: {e}")
 
     def run(self):
-        self.logger.info(f"{'='*50}\n🚀 LightGBM 二分類滾動優化與回測流程開始 (版本 15.4)\n{'='*50}")
+        self.logger.info(f"{'='*50}\n🚀 LightGBM 二分類滾動優化與回測流程開始 (版本 15.5)\n{'='*50}")
         target_tf = self.wfo_config.get('target_timeframe', 'H4').upper()
         self.logger.info(f"🎯 鎖定目標時間週期: {target_tf} (來自 config.yaml)")
         input_dir = Path(self.paths['features_data'])
@@ -404,7 +355,7 @@ class MLOptimizerAndBacktester:
         self._generate_final_summary()
 
     def _generate_final_summary(self):
-        print(f"\n{'='*80}\n🎉 所有市場滾動回測最終總結 (LightGBM v15.4)\n{'='*80}")
+        print(f"\n{'='*80}\n🎉 所有市場滾動回測最終總結 (LightGBM v15.5)\n{'='*80}")
         if self.all_market_results:
             summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index'); summary_df.index.name = 'Market'
             cols_order = ['final_pnl', 'total_trades', 'win_rate', 'profit_factor', 'avg_sharpe', 'avg_drawdown', 'total_folds']
