@@ -1,6 +1,6 @@
 # 檔名: 4_optimization_lgbm.py
 # 描述: 【二分類重構版】 - 使用 LightGBM 模型進行參數優化與回測
-# 版本: 15.3 (穩定回測版 - Robust Position Sizing)
+# 版本: 15.4 (修復變數賦值錯誤)
 
 import sys
 import yaml
@@ -204,7 +204,7 @@ class BinaryMLStrategy(bt.Strategy):
             pass # 忽略下單過程中的小錯誤
 
 # ==============================================================================
-#                      優化器與回測器 (其餘部分保持不變)
+#                      優化器與回測器 (修復變數賦值錯誤)
 # ==============================================================================
 class MLOptimizerAndBacktester:
     """機器學習優化器與回測器 - 二分類版"""
@@ -320,9 +320,14 @@ class MLOptimizerAndBacktester:
         start_date, end_date = df.index.min(), df.index.max()
         wfo_days = {k: timedelta(days=self.wfo_config[k]) for k in ['training_days', 'validation_days', 'testing_days', 'step_days']}
         current_date, fold_results, all_fold_best_params = start_date, [], []
+        
         for fold_number in range(1, 100):
-            train_start, val_start, test_start, test_end = current_date, current_date + wfo_days['training_days'], \
-                                                           val_start + wfo_days['validation_days'], test_start + wfo_days['testing_days']
+            # ★★★ 修復：分步計算日期，避免引用未定義變數 ★★★
+            train_start = current_date
+            val_start = train_start + wfo_days['training_days']
+            test_start = val_start + wfo_days['validation_days']
+            test_end = test_start + wfo_days['testing_days']
+            
             if test_end > end_date: break
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}~{val_start.date()}] | Val[{val_start.date()}~{test_start.date()}] | Test[{test_start.date()}~{test_end.date()}] ---")
             try:
@@ -378,7 +383,7 @@ class MLOptimizerAndBacktester:
         except Exception as e: self.logger.error(f"保存結果時發生錯誤: {e}")
 
     def run(self):
-        self.logger.info(f"{'='*50}\n🚀 LightGBM 二分類滾動優化與回測流程開始 (版本 15.3)\n{'='*50}")
+        self.logger.info(f"{'='*50}\n🚀 LightGBM 二分類滾動優化與回測流程開始 (版本 15.3.1)\n{'='*50}")
         target_tf = self.wfo_config.get('target_timeframe', 'H4').upper()
         self.logger.info(f"🎯 鎖定目標時間週期: {target_tf} (來自 config.yaml)")
         input_dir = Path(self.paths['features_data'])
@@ -395,7 +400,7 @@ class MLOptimizerAndBacktester:
         self._generate_final_summary()
 
     def _generate_final_summary(self):
-        print(f"\n{'='*80}\n🎉 所有市場滾動回測最終總結 (LightGBM v15.3)\n{'='*80}")
+        print(f"\n{'='*80}\n🎉 所有市場滾動回測最終總結 (LightGBM v15.3.1)\n{'='*80}")
         if self.all_market_results:
             summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index'); summary_df.index.name = 'Market'
             cols_order = ['final_pnl', 'total_trades', 'win_rate', 'profit_factor', 'avg_sharpe', 'avg_drawdown', 'total_folds']
