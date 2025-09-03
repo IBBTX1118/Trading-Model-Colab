@@ -177,7 +177,7 @@ class MLOptimizerAndBacktester:
                 'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 1.0, log=True), 'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 1.0, log=True)}
             neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
             if pos > 0 and neg > 0: model_params['scale_pos_weight'] = neg / pos
-            strategy_updates = {'entry_threshold': trial.suggest_float('entry_threshold', 0.55, 0.85),
+            strategy_updates = {'entry_threshold': trial.suggest_float('entry_threshold', 0.52, 0.85),
                                 'tp_atr_multiplier': trial.suggest_float('tp_atr_multiplier', 1.2, 3.0),
                                 'sl_atr_multiplier': trial.suggest_float('sl_atr_multiplier', 1.5, 3.5),
                                 'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05)}
