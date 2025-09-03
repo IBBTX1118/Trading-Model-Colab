@@ -5,6 +5,7 @@ pandas
 pyarrow
 finta
 setuptools
+pydantic
 
 # 機器學習與特徵篩選
 scikit-learn
