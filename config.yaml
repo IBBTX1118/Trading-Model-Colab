@@ -28,9 +28,9 @@ feature_selection:
 # --- 動態三道門檻標籤法設定 (ATR-Based) ---
 # 這是目前策略的核心定義，同時被 03 和 04 腳本使用
 triple_barrier_settings:
-  tp_atr_multiplier: 1.8      # [優化] 降低止盈門檻，從 2.5 -> 1.8，提高獲利機會
-  sl_atr_multiplier: 2.0      # [優化] 增加止損空間，從 1.5 -> 2.0，減少誤判出場
-  max_hold_periods: 30        # [優化] 延長觀察期，從 20 -> 30 (30根H4 K棒 = 120小時)
+  tp_atr_multiplier: 1.5      
+  sl_atr_multiplier: 1.5      
+  max_hold_periods: 48        
 
 # --- 滾動優化與回測設定 ---
 walk_forward_optimization:
