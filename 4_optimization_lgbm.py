@@ -1,6 +1,6 @@
 # 檔名: 4_optimization_lgbm.py
 # 描述: 【二分類重構版】 - 使用 LightGBM 模型進行參數優化與回測
-# 版本: 15.4 (修復變數賦值錯誤)
+# 版本: 15.4 (最終穩健版 - Robust Strategy Initialization & Sizing)
 
 import sys
 import yaml
@@ -18,7 +18,7 @@ import optuna
 from collections import defaultdict
 
 # ==============================================================================
-#                      輔助函式 (保持不變)
+#                      輔助函式
 # ==============================================================================
 def load_config(config_path: str = 'config.yaml') -> Dict:
     """安全載入配置檔案"""
@@ -39,7 +39,11 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     sl_multiplier = settings['sl_atr_multiplier']
     max_hold = settings['max_hold_periods']
 
-    atr_col_name = next((col for col in df_out.columns if 'ATR_14' in col), None)
+    # 動態找到ATR欄位 (優先使用D1的ATR，若無則用當前的)
+    atr_col_name = next((col for col in df_out.columns if 'D1_ATR_14' in col), None)
+    if atr_col_name is None:
+        atr_col_name = next((col for col in df_out.columns if 'ATR_14' in col), None)
+
     if atr_col_name is None:
         raise ValueError("數據中缺少 ATR 欄位，無法創建標籤。")
     print(f"標籤創建使用ATR欄位: {atr_col_name}")
@@ -75,7 +79,7 @@ def create_triple_barrier_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFra
     return df_out.join(outcomes.to_frame())
 
 # ==============================================================================
-#                      交易策略 (核心修改處)
+#                      交易策略 (整合所有修正)
 # ==============================================================================
 class BinaryMLStrategy(bt.Strategy):
     """機器學習交易策略 (二分類版)"""
@@ -93,23 +97,41 @@ class BinaryMLStrategy(bt.Strategy):
         if not self.p.model or not self.p.features:
             raise ValueError("模型和特徵列表必須提供！")
 
-        self.trend_indicator = next((getattr(self.data.lines, n) for n in ['D1_is_uptrend', 'is_uptrend'] if hasattr(self.data.lines, n)), None)
-        self.atr_indicator = next((getattr(self.data.lines, n) for n in ['D1_ATR_14', 'ATR_14'] if hasattr(self.data.lines, n)), None)
+        # ★★★ 核心修正 v15.4：使用更穩健、具備優先級的方式尋找指標 ★★★
+        self.trend_indicator = None
+        # 依序尋找最可能出現的趨勢指標名稱 (從最 specific 到最 general)
+        trend_indicator_names = ['H4_D1_is_uptrend', 'D1_is_uptrend', 'is_uptrend']
+        for name in trend_indicator_names:
+            if hasattr(self.data.lines, name):
+                self.trend_indicator = getattr(self.data.lines, name)
+                print(f"✅ 成功找到並使用趨勢指標: {name}")
+                break
 
-        if self.atr_indicator is None: raise ValueError("找不到ATR指標，策略無法運行")
-        if self.trend_indicator is None: print("警告: 找不到趨勢指標，將使用默認上漲趨勢")
+        self.atr_indicator = None
+        # 依序尋找最可能出現的ATR指標名稱 (優先使用當前週期的ATR)
+        atr_indicator_names = ['ATR_14', 'H4_D1_ATR_14', 'D1_ATR_14']
+        for name in atr_indicator_names:
+            if hasattr(self.data.lines, name):
+                self.atr_indicator = getattr(self.data.lines, name)
+                print(f"✅ 成功找到並使用ATR指標: {name}")
+                break
+        
+        # 確保關鍵指標存在
+        if self.atr_indicator is None:
+            raise ValueError("❌ 找不到任何可用的ATR指標，策略無法運行")
+        if self.trend_indicator is None:
+            print("⚠️ 警告: 找不到趨勢指標，策略將使用默認上漲趨勢 (is_uptrend = True)。")
 
         self.current_order = None
 
     def log(self, txt, dt=None):
-        dt = dt or self.datas[0].datetime.date(0)
-        # print(f'{dt.isoformat()} - {txt}') # 正式回測時可註解掉，減少輸出
+        # 為了保持日誌乾淨，優化過程中可以暫時關閉打印
+        pass
 
     def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]: return
-        if order.status == order.Completed:
-            self.log(f'{"買入" if order.isbuy() else "賣出"}執行: P={order.executed.price:.5f}, Qty={order.executed.size:.3f}')
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log(f'訂單失敗: {order.getstatusname()}')
         self.current_order = None
 
@@ -128,42 +150,25 @@ class BinaryMLStrategy(bt.Strategy):
         except Exception:
             return 0.0
 
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-    # ★★★ 核心修改：加入安全檢查，使倉位計算更穩健 (Robust Position Sizing) ★★★
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
     def calculate_position_size(self, atr_value: float) -> float:
-        """計算持倉大小 (v15.3 - 新增安全檢查)"""
+        """計算持倉大小 (v15.3 - 穩健版)"""
         try:
             portfolio_value = self.broker.getvalue()
-            
-            # 基於ATR的風險計算
             sl_distance = atr_value * self.p.sl_atr_multiplier
-
-            # --- 安全檢查 1: 最小止損距離 ---
-            # 防止因ATR過小或sl_multiplier過小導致止損距離趨近於0，從而引發除以零的錯誤
-            # 這個值應根據交易對的價格尺度調整，例如EURUSD為0.0005 (5 pips)
-            # 由於我們處理多個市場，可以使用價格的百分比作為一個通用標準
-            min_sl_distance = self.data.close[0] * 0.0005  # 最小止損距離設為市價的0.05%
+            
+            min_sl_distance = self.data.close[0] * 0.0005
             if sl_distance < min_sl_distance:
-                # self.log(f"警告: 止損距離 {sl_distance:.5f} 過小，跳過交易。")
                 return 0.0
 
-            # 基於固定風險百分比的倉位計算
             risk_amount = portfolio_value * self.p.risk_per_trade
             position_size = risk_amount / sl_distance
-
-            # --- 安全檢查 2: 最大倉位限制 ---
-            # 增加一道保險，防止任何意外情況導致計算出過大的倉位
-            # 這裡限制單筆交易的名義價值不超過帳戶總值的10倍 (約10倍槓桿)
+            
             max_position_value = portfolio_value * 10
             if (position_size * self.data.close[0]) > max_position_value:
-                # self.log(f"警告: 計算倉位價值過大，觸發最大槓桿限制。")
                 position_size = max_position_value / self.data.close[0]
 
-            return max(position_size, 0.001) # 最小交易單位
-            
-        except Exception as e:
-            self.log(f"計算倉位大小時發生錯誤: {e}")
+            return max(position_size, 0.001)
+        except Exception:
             return 0.0
 
     def next(self):
@@ -177,7 +182,10 @@ class BinaryMLStrategy(bt.Strategy):
         atr_value = self.atr_indicator[0]
         if atr_value <= 0 or pd.isna(atr_value): return
 
-        is_uptrend = self.trend_indicator[0] > 0.5 if self.trend_indicator is not None else True
+        is_uptrend = True
+        if self.trend_indicator is not None:
+            try: is_uptrend = self.trend_indicator[0] > 0.5
+            except IndexError: return
 
         position_size = self.calculate_position_size(atr_value)
         if position_size <= 0: return
@@ -186,25 +194,24 @@ class BinaryMLStrategy(bt.Strategy):
             if is_uptrend and win_prob > self.p.entry_threshold:
                 sl_price = current_price - (atr_value * self.p.sl_atr_multiplier)
                 tp_price = current_price + (atr_value * self.p.tp_atr_multiplier)
-                main_order = self.buy(size=position_size, exectype=bt.Order.Market)
+                main_order = self.buy(size=position_size)
                 if main_order:
                     self.sell(size=position_size, exectype=bt.Order.Stop, price=sl_price, parent=main_order)
                     self.sell(size=position_size, exectype=bt.Order.Limit, price=tp_price, parent=main_order)
                     self.current_order = main_order
-
             elif not is_uptrend and win_prob > self.p.entry_threshold:
                 sl_price = current_price + (atr_value * self.p.sl_atr_multiplier)
                 tp_price = current_price - (atr_value * self.p.tp_atr_multiplier)
-                main_order = self.sell(size=position_size, exectype=bt.Order.Market)
+                main_order = self.sell(size=position_size)
                 if main_order:
                     self.buy(size=position_size, exectype=bt.Order.Stop, price=sl_price, parent=main_order)
                     self.buy(size=position_size, exectype=bt.Order.Limit, price=tp_price, parent=main_order)
                     self.current_order = main_order
         except Exception:
-            pass # 忽略下單過程中的小錯誤
+            pass
 
 # ==============================================================================
-#                      優化器與回測器 (修復變數賦值錯誤)
+#                      優化器與回測器 (無需修改)
 # ==============================================================================
 class MLOptimizerAndBacktester:
     """機器學習優化器與回測器 - 二分類版"""
@@ -255,11 +262,6 @@ class MLOptimizerAndBacktester:
                 'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05)}
             if strategy_updates['tp_atr_multiplier'] <= strategy_updates['sl_atr_multiplier']: return -999.0
             model = lgb.LGBMClassifier(**model_params).fit(X_train, y_train)
-            
-            # 檢查模型預測分佈
-            train_preds = model.predict_proba(X_train)[:, 1]
-            self.logger.debug(f"訓練集預測分佈: 均值={train_preds.mean():.3f}, 標準差={train_preds.std():.3f}")
-            
             df_val_trades_only = df_val[df_val['label'] != 0].copy()
             if df_val_trades_only.empty: return -999.0
             result = self.run_backtest_on_fold(df_val_trades_only, model, available_features, {**self.strategy_params, **strategy_updates})
@@ -294,8 +296,10 @@ class MLOptimizerAndBacktester:
             if total_trades == 0: return self._get_empty_result(pnl=final_value - self.wfo_config['initial_cash'])
             sharpe_ratio = analyzers.sharpe.get_analysis().get('sharperatio', 0.0) or 0.0
             return {'pnl': final_value - self.wfo_config['initial_cash'], 'total_trades': total_trades,
-                    'won_trades': trade_analysis.won.total, 'lost_trades': trade_analysis.lost.total,
-                    'pnl_won_total': trade_analysis.won.pnl.total, 'pnl_lost_total': trade_analysis.lost.pnl.total,
+                    'won_trades': trade_analysis.won.total if hasattr(trade_analysis.won, 'total') else 0,
+                    'lost_trades': trade_analysis.lost.total if hasattr(trade_analysis.lost, 'total') else 0,
+                    'pnl_won_total': trade_analysis.won.pnl.total if hasattr(trade_analysis.won.pnl, 'total') else 0.0,
+                    'pnl_lost_total': trade_analysis.lost.pnl.total if hasattr(trade_analysis.lost.pnl, 'total') else 0.0,
                     'max_drawdown': analyzers.drawdown.get_analysis().max.drawdown, 'sharpe_ratio': sharpe_ratio}
         except Exception as e: self.logger.error(f"結果解析錯誤: {e}"); return self._get_empty_result()
 
@@ -325,14 +329,9 @@ class MLOptimizerAndBacktester:
         start_date, end_date = df.index.min(), df.index.max()
         wfo_days = {k: timedelta(days=self.wfo_config[k]) for k in ['training_days', 'validation_days', 'testing_days', 'step_days']}
         current_date, fold_results, all_fold_best_params = start_date, [], []
-        
         for fold_number in range(1, 100):
-            # ★★★ 修復：分步計算日期，避免引用未定義變數 ★★★
-            train_start = current_date
-            val_start = train_start + wfo_days['training_days']
-            test_start = val_start + wfo_days['validation_days']
-            test_end = test_start + wfo_days['testing_days']
-            
+            train_start, val_start, test_start, test_end = current_date, current_date + wfo_days['training_days'], \
+                                                           val_start + wfo_days['validation_days'], test_start + wfo_days['testing_days']
             if test_end > end_date: break
             print(f"\n--- Fold {fold_number}: Train[{train_start.date()}~{val_start.date()}] | Val[{val_start.date()}~{test_start.date()}] | Test[{test_start.date()}~{test_end.date()}] ---")
             try:
@@ -388,7 +387,7 @@ class MLOptimizerAndBacktester:
         except Exception as e: self.logger.error(f"保存結果時發生錯誤: {e}")
 
     def run(self):
-        self.logger.info(f"{'='*50}\n🚀 LightGBM 二分類滾動優化與回測流程開始 (版本 15.3.1)\n{'='*50}")
+        self.logger.info(f"{'='*50}\n🚀 LightGBM 二分類滾動優化與回測流程開始 (版本 15.4)\n{'='*50}")
         target_tf = self.wfo_config.get('target_timeframe', 'H4').upper()
         self.logger.info(f"🎯 鎖定目標時間週期: {target_tf} (來自 config.yaml)")
         input_dir = Path(self.paths['features_data'])
@@ -405,7 +404,7 @@ class MLOptimizerAndBacktester:
         self._generate_final_summary()
 
     def _generate_final_summary(self):
-        print(f"\n{'='*80}\n🎉 所有市場滾動回測最終總結 (LightGBM v15.3.1)\n{'='*80}")
+        print(f"\n{'='*80}\n🎉 所有市場滾動回測最終總結 (LightGBM v15.4)\n{'='*80}")
         if self.all_market_results:
             summary_df = pd.DataFrame.from_dict(self.all_market_results, orient='index'); summary_df.index.name = 'Market'
             cols_order = ['final_pnl', 'total_trades', 'win_rate', 'profit_factor', 'avg_sharpe', 'avg_drawdown', 'total_folds']
