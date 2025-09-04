@@ -1,29 +1,32 @@
 # 檔名: 6_test_connection.py
-# 描述: 專門用於測試 Python 與 OANDA MT5 模擬帳戶的連線。(v1.1 修復版)
+# 描述: 專門用於測試 Python 與 OANDA MT5 模擬帳戶的連線。
+# 版本: 1.2 (採用與腳本1相同的「搭便車」連線模式)
 
 import MetaTrader5 as mt5
 
-# from datetime import datetime # <--- 修改點 1：移除了未被使用的 import
-
-# --- ↓↓↓ 請在這裡填入您的帳戶資訊 ↓↓↓ ---
-# 從您的截圖中獲取的資訊
-MT5_LOGIN = 1600014313  # <--- 修改點 2：將登入名改為整數 (移除引號)，並改為大寫命名
-MT5_SERVER = "OANDA-Demo-1"  # <--- 修改點 3：變數名改為大寫
-# 請務必手動輸入您申請時設定的密碼
-MT5_PASSWORD = "2130C2f3a966@"  # <--- 修改點 4：變數名改為大寫
+# --- ↓↓↓ 帳戶資訊（修改後不再用於直接登入）↓↓↓ ---
+# 由於改為使用「搭便車」模式連線，以下資訊不再直接傳入 mt5.initialize()
+# 您可以保留它們作為參考，但腳本不會使用它們來登入。
+MT5_LOGIN = 1600014313
+MT5_SERVER = "OANDA-Demo-1"
+MT5_PASSWORD = "2130C23966@" # 密碼不再需要
 
 
 def connect_to_mt5():
-    """初始化並連接到 MetaTrader 5"""
-    print("正在初始化 MetaTrader 5...")
+    """初始化並連接到 MetaTrader 5 (使用搭便車模式)"""
+    print("正在初始化 MetaTrader 5 (搭便車模式)...")
 
-    # 嘗試初始化 MT5 終端
-    # 使用修正後的變數
-    if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+    # ==============================================================================
+    # ★★★ 核心修改點 ★★★
+    # 移除 mt5.initialize() 中的 login, password, server 參數
+    # 這會讓它自動尋找並連接到已登入的 MT5 桌面應用程式
+    # ==============================================================================
+    if not mt5.initialize():
         print(f"MT5 初始化失敗, 錯誤代碼 = {mt5.last_error()}")
-        print("請檢查：")
-        print("1. OANDA MT5 桌面應用程式是否正在運行？")
-        print("2. 帳號、密碼、伺服器名稱是否完全正確？")
+        print("\n請檢查：")
+        # ★★★ 修改點：更新錯誤提示 ★★★
+        print("1. OANDA MT5 桌面應用程式是否已開啟，並且『成功登入』到您的帳戶？")
+        print("2. 如果 MT5 是 64 位元版本，請確保您的 Python 也是 64 位元。")
         return False
 
     print(f"MT5 初始化成功！(版本: {mt5.version()})")
@@ -40,7 +43,14 @@ def get_account_info():
     # 獲取帳戶資訊對象
     info = account_info._asdict()
 
-    print("\n--- 帳戶資訊 ---")
+    # ★★★ 修改點：增加連線帳戶驗證 ★★★
+    print("\n--- 已連線的帳戶資訊 ---")
+    if info['login'] == MT5_LOGIN:
+        print(f"✅ 成功連接到預期的帳戶: {info['login']}")
+    else:
+        print(f"⚠️  警告：腳本連接到的帳戶 ({info['login']}) 與設定檔中的帳戶 ({MT5_LOGIN}) 不符！")
+        print("   請確認您 MT5 桌面程式登入的是正確的帳戶。")
+
     for key, value in info.items():
         print(f"{key:<15}: {value}")
     print("------------------")
