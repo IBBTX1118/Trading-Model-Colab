@@ -1,5 +1,5 @@
 # 檔名: 3_feature_selection_with_diagnostics.py
-# 版本: 5.0 (整合診斷版)
+# 版本: 5.1 (修正 NameError)
 # 描述: 在為所有市場進行特徵篩選前，先對一個樣本市場執行快速診斷。
 
 import logging
@@ -7,7 +7,7 @@ import sys
 import json
 import yaml
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional # ★★★ 核心修正：在這裡導入 Optional ★★★
 from collections import defaultdict
 import pandas as pd
 import numpy as np
@@ -30,7 +30,7 @@ class QuickDiagnostics:
             self.logger.critical(f"❌ (診斷器) 配置檔載入失敗: {e}")
             raise
 
-    def check_data_files(self, market_name: str):
+    def check_data_files(self, market_name: str) -> bool:
         self.logger.info("\n🔍 (診斷) 檢查數據檔案...")
         features_dir = Path(self.paths['features_data'])
         market_folder = "_".join(market_name.split('_')[:2])
@@ -107,14 +107,10 @@ class QuickDiagnostics:
         self.test_label_creation(df)
         self.logger.info(f"\n{'='*80}\n🚀 快速診斷完畢。\n{'='*80}")
 
-
 # ==============================================================================
 #                      2. 特徵篩選器 (來自 3_feature_selection.py)
 # ==============================================================================
 class FeatureSelector:
-    # ... 此處的 FeatureSelector class 的所有內容與您提供的
-    # ... 3_feature_selection.py 完全相同，為了簡潔此處省略。
-    # ... 請將您原本的 FeatureSelector class 內容完整複製到這裡。
     def __init__(self, config_path: Path = Path("config.yaml")):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config_path = config_path
@@ -127,7 +123,6 @@ class FeatureSelector:
         self.output_dir.mkdir(parents=True, exist_ok=True)
     def get_feature_importance_for_file(self, df: pd.DataFrame) -> pd.DataFrame:
         non_feature_cols = ['open', 'high', 'low', 'close', 'tick_volume', 'target', 'time', 'spread', 'real_volume', 'label', 'hit_time']
-        # 使用自適應標籤
         df_labeled = create_adaptive_labels(df, self.tb_settings)
         features = [col for col in df_labeled.columns if col not in non_feature_cols]
         X, y = df_labeled[features], df_labeled['target']
@@ -171,8 +166,6 @@ class FeatureSelector:
             self.save_selected_features(top_features, market_name)
         self.logger.info(f"\n{'='*80}\n🚀 特徵篩選流程完畢。\n{'='*80}")
 
-# --- 輔助函式 create_adaptive_labels 和 create_triple_barrier_labels ---
-# ... 這兩個函數也需要從您原本的 3_feature_selection.py 複製過來 ...
 def create_adaptive_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
     df_out = df.copy()
     tp_base, sl_base, max_hold = settings['tp_atr_multiplier'], settings['sl_atr_multiplier'], settings['max_hold_periods']
@@ -202,21 +195,19 @@ def create_adaptive_labels(df: pd.DataFrame, settings: Dict) -> pd.DataFrame:
     df_out = df_out.join(outcomes); df_out['target'] = (df_out['label'] == 1).astype(int)
     df_out.drop(columns=['tp_adj', 'sl_adj'], inplace=True, errors='ignore')
     return df_out
+
 # ==============================================================================
 #                      3. 主執行區塊
 # ==============================================================================
 if __name__ == "__main__":
-    # --- 基本設定 ---
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
     CONFIG_PATH = Path("config.yaml")
-    DIAGNOSTICS_MARKET_SAMPLE = "EURUSD_sml_H4" # 指定一個用於快速診斷的樣本市場
+    DIAGNOSTICS_MARKET_SAMPLE = "EURUSD_sml_H4" 
 
     try:
-        # --- 步驟 1: 執行快速診斷 ---
         diagnostics = QuickDiagnostics(config_path=CONFIG_PATH)
         diagnostics.run_full_diagnosis(market_name=DIAGNOSTICS_MARKET_SAMPLE)
         
-        # --- 步驟 2: 執行正式的特徵篩選 ---
         selector = FeatureSelector(config_path=CONFIG_PATH)
         selector.run()
 
