@@ -1,5 +1,5 @@
 # ==============================================================================
-# 全域設定檔 for 量化交易模型 v10.1 (週期參數化版)
+# 全域設定檔 for 量化交易模型 v11.0 (H1 核心策略版)
 # ==============================================================================
 
 # --- 路徑設定 ---
@@ -7,10 +7,8 @@ paths:
   raw_data: "Output_Data_Pipeline_v2/MarketData"
   features_data: "Output_Feature_Engineering/MarketData_with_Combined_Features_v3"
   ml_pipeline_output: "Output_ML_Pipeline"
-  selected_features_filename: "selected_features.json"
 
-# --- 標籤與特徵篩選設定 (用於 03_feature_selection.py) ---
-# 注意：標籤設定已與 04 腳本同步，由下方的 triple_barrier_settings 控制
+# --- 標籤與特徵篩選設定 ---
 feature_selection:
   top_n_features: 20
   lgbm_params:
@@ -25,18 +23,18 @@ feature_selection:
     n_jobs: -1
     verbose: -1
 
-# --- 動態三道門檻標籤法設定 (ATR-Based) ---
-# 這是目前策略的核心定義，同時被 03 和 04 腳本使用
+# --- 動態三道門檻標籤法設定 (已為 H1 週期調優) ---
 triple_barrier_settings:
-  tp_atr_multiplier: 1.5      
-  sl_atr_multiplier: 1.5      
-  max_hold_periods: 48        
+  tp_atr_multiplier: 1.5      # H1 週期止盈目標相對較小
+  sl_atr_multiplier: 1.5      # H1 週期止損也相對收緊
+  max_hold_periods: 48        # H1 K棒的持倉週期 (48根 = 2天)
 
 # --- 滾動優化與回測設定 ---
 walk_forward_optimization:
-  # ★★★ 新增參數：指定模型優化的目標時間週期 ("H1", "H4", or "D1") ★★★
+  # ★★★ 核心：將所有流程聚焦於 H1 ★★★
   target_timeframe: "H1"
-  n_trials: 30                # [優化] 增加 Optuna 試驗次數，從 5 -> 30，進行更充分的參數搜索
+  
+  n_trials: 50                # 在 H1 上進行更充分的參數搜索
   training_days: 270
   validation_days: 90
   testing_days: 45
@@ -44,7 +42,7 @@ walk_forward_optimization:
   initial_cash: 100000.0
   commission: 0.001
 
-# --- 交易策略參數 ---
+# --- 交易策略參數 (此為 Optuna 搜索的基礎，非最終參數) ---
 strategy_params:
-  entry_threshold: 0.35       # [優化] 降低基礎入場門檻，從 0.45 -> 0.35，增加交易機會
-  risk_per_trade: 0.015       # [優化] 稍微增加基礎風險，從 0.01 -> 0.015，提升潛在收益
+  entry_threshold: 0.52       # 降低基礎入場門檻，讓 Optuna 從更寬的範圍搜索
+  risk_per_trade: 0.015       # 基礎風險設定
